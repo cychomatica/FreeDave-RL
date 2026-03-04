@@ -580,8 +580,8 @@ class DLM_Generator:
         num_prefill_blocks = prompt_length // block_length
         prefill_length = num_prefill_blocks * block_length
         
-        assert decoding_steps % num_total_blocks == 0, 'decoding_steps {} must be divisible by num_total_blocks {}'.format(decoding_steps, num_total_blocks)
-        steps_per_block = decoding_steps // num_total_blocks
+        assert block_length % self.token_per_step == 0, 'block_length={} must be divisible by self.token_per_step={}'.format(block_length, self.token_per_step)
+        steps_per_block = block_length // self.token_per_step
 
         attention_mask, position_ids = self.get_attention_mask_and_position_ids(
             attention_mask=attention_mask,
@@ -599,7 +599,7 @@ class DLM_Generator:
             if cur_attn_mask.dim() == 3:
                 cur_attn_mask = cur_attn_mask[:, None, :, :]
             cur_position_ids = position_ids[:, :prefill_length]
-            logits, past_key_values, attentions = self.get_processed_model_outputs(
+            _, past_key_values, _ = self.get_processed_model_outputs(
                 cur_x,
                 attention_mask=cur_attn_mask,
                 position_ids=cur_position_ids,
@@ -609,6 +609,7 @@ class DLM_Generator:
             )
 
         # Decoding stage
+        global_step = 0
         for block_idx in range(num_prefill_blocks, num_total_blocks):
 
             # determine the number of future blocks
@@ -651,7 +652,8 @@ class DLM_Generator:
             )
             
             # decoding loop for the current block
-            for step in range(steps_per_block):
+            while True:
+            # for step in range(steps_per_block):
 
                 current_block_mask_index = (current_block_x == mask_token_id)
 
@@ -743,6 +745,7 @@ class DLM_Generator:
                         total_accepted_steps += matched_steps
                         total_draft_steps += current_block_draft_steps
                         if eager_acceptance_mode:
+                            # TODO: implement eager acceptance mode
                             pass
                         else:
                             current_block_x = current_block_x_draft[:, matched_steps, :]
@@ -752,12 +755,14 @@ class DLM_Generator:
                             current_block_x0 = current_block_x0_draft.view(batch_size, current_block_draft_steps, *current_block_x.shape[1:])[:, matched_steps, :]
                             current_block_confidence = current_block_confidence_draft.view(batch_size, current_block_draft_steps, *current_block_x.shape[1:])[:, matched_steps, :]
 
-                if (current_block_x == mask_token_id).all():
+                        step += 1
+
+                if (current_block_x[:, :block_length] == mask_token_id).all():
                     # if the current block is all unmasked, store the current block's kv and exit the decoding loop
                     _, past_key_values, _ = self.get_processed_model_outputs(
-                        current_block_x,
-                        current_block_attention_mask,
-                        current_block_position_ids,
+                        current_block_x[:, :block_length],
+                        current_block_attention_mask[..., :block_length, :current_block_start + block_length],
+                        current_block_position_ids[:, :block_length],
                         past_key_values=past_key_values,
                         use_cache=True,
                         store_kv=True
