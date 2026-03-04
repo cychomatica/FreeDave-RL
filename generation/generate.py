@@ -575,6 +575,7 @@ class DLM_Generator:
         x = F.pad(input_ids, (0, max_length - prompt_length), value=mask_token_id)
 
         trajectory_step_map = torch.full((batch_size, max_length), -torch.inf, device=x.device, dtype=torch.long)
+        global_step = 0
 
         num_prefill_blocks = prompt_length // block_length
         prefill_length = num_prefill_blocks * block_length
@@ -677,12 +678,18 @@ class DLM_Generator:
                     # here draft tokens should be sampled by single step
                     # Take every interval-th (current_block_draft_steps-th) sample in batch as per interval batch index
                     current_block_x = current_block_x_draft[::current_block_draft_steps]
+                    newly_unmasked = current_block_mask_index & (current_block_x != mask_token_id)
+                    trajectory_step_map[:, current_block_start:current_block_end][newly_unmasked] = global_step
+                    global_step += 1
                     step += 1
                     break
                 else:
                     if not eager_acceptance_mode and current_block_mask_index.sum() == self.token_per_step:
                         # with eager mode disabled, accept draft tokens and exit at the last step in the current block
                         current_block_x = current_block_x_draft[::current_block_draft_steps]
+                        newly_unmasked = current_block_mask_index & (current_block_x != mask_token_id)
+                        trajectory_step_map[:, current_block_start:current_block_end][newly_unmasked] = global_step
+                        global_step += 1
                         step += 1
                         break
                     else:
@@ -739,6 +746,9 @@ class DLM_Generator:
                             pass
                         else:
                             current_block_x = current_block_x_draft[:, matched_steps, :]
+                            newly_unmasked = current_block_mask_index & (current_block_x != mask_token_id)
+                            trajectory_step_map[:, current_block_start:current_block_end][newly_unmasked] = global_step
+                            global_step += 1
                             current_block_x0 = current_block_x0_draft.view(batch_size, current_block_draft_steps, *current_block_x.shape[1:])[:, matched_steps, :]
                             current_block_confidence = current_block_confidence_draft.view(batch_size, current_block_draft_steps, *current_block_x.shape[1:])[:, matched_steps, :]
 
@@ -756,5 +766,5 @@ class DLM_Generator:
 
             # commit the current block to the sequence
             x[:, current_block_start:current_block_end] = current_block_x
-        
-        return x
+
+        return x, trajectory_step_map[:, prompt_length:prompt_length + max_gen_length]
