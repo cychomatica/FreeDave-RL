@@ -120,7 +120,7 @@ class DLM_Generator:
         position_ids: Optional[torch.Tensor] = None, 
         shared_prefix_length: Optional[int] = None,
         branch_length: Optional[int] = None,
-        shared_suffix_length: Optional[int] = None,
+        shared_suffix_length: Optional[int] = 0,
         num_branches: Optional[int] = None
     ):
         '''
@@ -621,30 +621,33 @@ class DLM_Generator:
                 confidence_priority_shift = None
 
             current_block_start = block_idx * block_length
-            current_block_end = current_block_start + (num_future_blocks + 1) * block_length
-            current_window = slice(current_block_start, current_block_end)
+            current_block_end = current_block_start + block_length
+
+            current_window_start = current_block_start
+            current_window_end = current_window_start + (num_future_blocks + 1) * block_length
+            current_window_len = current_window_end - current_window_start
 
             # NOTE: still use the block-causal attention mask, instead of just merge the current block and future blocks into a larger block with full attention mask
-            current_block_attention_mask = attention_mask[..., current_block_start:current_block_end, :current_block_end] # (1, 1, current_block_end - current_block_start, current_block_end)
-            if current_block_attention_mask.dim() == 3:
-                current_block_attention_mask = current_block_attention_mask[:, None, :, :]
-            current_block_position_ids = position_ids[:, current_block_start:current_block_end]
+            current_window_attention_mask = attention_mask[..., current_window_start:current_window_end, :current_window_end] # (1, 1, current_window_len, current_window_end)
+            if current_window_attention_mask.dim() == 3:
+                current_window_attention_mask = current_window_attention_mask[:, None, :, :]
+            current_window_position_ids = position_ids[:, current_window_start:current_window_end]
 
-            current_block_x = x[:, current_block_start:current_block_end].clone() # (batch, current_block_end - current_block_start)
-            current_block_mask_index = (current_block_x == mask_token_id)
+            current_window_x = x[:, current_window_start:current_window_end].clone() # (batch, current_window_len)
+            current_window_mask_index = (current_window_x == mask_token_id)
 
             logits, _, _ = self.get_processed_model_outputs(
-                current_block_x,
-                attention_mask=current_block_attention_mask,
-                position_ids=current_block_position_ids,
+                current_window_x,
+                attention_mask=current_window_attention_mask,
+                position_ids=current_window_position_ids,
                 past_key_values=past_key_values,
                 use_cache=True,
                 store_kv=False
             )
 
-            current_block_x0, current_block_confidence = self.get_mask_token_prediction_and_confidence(
+            current_window_x0, current_window_confidence = self.get_mask_token_prediction_and_confidence(
                 logits=logits,
-                mask_index=current_block_mask_index,
+                mask_index=current_window_mask_index,
                 mask_token_id=mask_token_id,
                 temperature=temperature,
                 top_p=top_p,
@@ -655,41 +658,42 @@ class DLM_Generator:
             while True:
             # for step in range(steps_per_block):
 
-                current_block_mask_index = (current_block_x == mask_token_id)
+                current_window_mask_index = (current_window_x == mask_token_id)
+                # current_block_mask_index = current_window_mask_index[:, :block_length]
 
                 if num_total_blocks - block_idx > 1 and num_future_blocks > 0:
-                    current_block_draft_steps = min(draft_steps, steps_per_block * num_future_blocks)
+                    current_window_draft_steps = min(draft_steps, steps_per_block * num_future_blocks)
                 else:
-                    current_block_draft_steps = min(draft_steps, steps_per_block - step)
+                    current_window_draft_steps = min(draft_steps, steps_per_block - step)
 
-                current_block_x_draft = self.token_transfer(
-                    x=current_block_x,
-                    x0=current_block_x0,
-                    draft_steps=current_block_draft_steps,
-                    confidence=current_block_confidence,
+                current_window_x_draft = self.token_transfer(
+                    x=current_window_x,
+                    x0=current_window_x0,
+                    draft_steps=current_window_draft_steps,
+                    confidence=current_window_confidence,
                     confidence_priority_shift=confidence_priority_shift,
                     block_length=block_length,
                     mask_token_id=mask_token_id,
                     alg_temp=alg_temp,
                     token_per_step=self.token_per_step,
                 ) # (batch_size * current_block_draft_steps, current_block_end - current_block_start)
-                assert current_block_x_draft.shape == (batch_size * current_block_draft_steps, current_block_end - current_block_start), 'current_block_x_draft.shape must be (batch_size * current_block_draft_steps, current_block_end - current_block_start)'
+                assert current_window_x_draft.shape == (batch_size * current_window_draft_steps, current_window_len), 'current_window_x_draft.shape must be (batch_size * current_window_draft_steps, current_window_len)'
 
-                if num_total_blocks - block_idx == 1 and current_block_mask_index.sum() == self.token_per_step:
+                if num_total_blocks - block_idx == 1 and current_window_mask_index[:, :block_length].sum() == self.token_per_step:
                     # if the last step in the last block, accept draft tokens and exit
                     # here draft tokens should be sampled by single step
                     # Take every interval-th (current_block_draft_steps-th) sample in batch as per interval batch index
-                    current_block_x = current_block_x_draft[::current_block_draft_steps]
-                    newly_unmasked = current_block_mask_index & (current_block_x != mask_token_id)
+                    current_window_x = current_window_x_draft[::current_window_draft_steps]
+                    newly_unmasked = current_window_mask_index & (current_window_x != mask_token_id)
                     trajectory_step_map[:, current_block_start:current_block_end][newly_unmasked] = global_step
                     global_step += 1
                     step += 1
                     break
                 else:
-                    if not eager_acceptance_mode and current_block_mask_index.sum() == self.token_per_step:
+                    if not eager_acceptance_mode and current_window_mask_index[:, :block_length].sum() == self.token_per_step:
                         # with eager mode disabled, accept draft tokens and exit at the last step in the current block
-                        current_block_x = current_block_x_draft[::current_block_draft_steps]
-                        newly_unmasked = current_block_mask_index & (current_block_x != mask_token_id)
+                        current_window_x = current_window_x_draft[::current_window_draft_steps]
+                        newly_unmasked = current_window_mask_index & (current_window_x != mask_token_id)
                         trajectory_step_map[:, current_block_start:current_block_end][newly_unmasked] = global_step
                         global_step += 1
                         step += 1
@@ -697,37 +701,37 @@ class DLM_Generator:
                     else:
                         # batch forward the draft blocks
                         # v2: use tree attention (https://arxiv.org/abs/2401.10774) instead of expanding kv cache to further reduce memory overhead
-                        current_draft_blocks_tree_attention_mask, current_draft_blocks_tree_position_ids = self.create_tree_attention_mask_and_position_ids(
-                            attention_mask=current_block_attention_mask,
-                            position_ids=current_block_position_ids,
-                            shared_prefix_length=current_block_start,
-                            branch_length=current_block_end - current_block_start,
+                        current_window_draft_blocks_tree_attention_mask, current_window_draft_blocks_tree_position_ids = self.create_tree_attention_mask_and_position_ids(
+                            attention_mask=current_window_attention_mask,
+                            position_ids=current_window_position_ids,
+                            shared_prefix_length=current_window_start,
+                            branch_length=current_window_len,
                             shared_suffix_length=0,
-                            num_branches=current_block_draft_steps
+                            num_branches=current_window_draft_steps
                         )
 
                         logits, _, _ = self.get_processed_model_outputs(
-                            current_block_x_draft.view(batch_size, -1), # (batch_size, (current_block_end - current_block_start) * current_block_draft_steps)
-                            attention_mask=current_draft_blocks_tree_attention_mask,
-                            position_ids=current_draft_blocks_tree_position_ids,
+                            current_window_x_draft.view(batch_size, -1), # (batch_size, current_window_len * current_window_draft_steps)
+                            attention_mask=current_window_draft_blocks_tree_attention_mask,
+                            position_ids=current_window_draft_blocks_tree_position_ids,
                             past_key_values=past_key_values,
                             use_cache=True,
                             store_kv=False
-                        ) # (batch_size, (current_block_end - current_block_start) * current_block_draft_steps, vocab_size)
+                        ) # (batch_size, current_window_len * current_window_draft_steps, vocab_size)
 
-                        current_block_x0_draft, current_block_confidence_draft = self.get_mask_token_prediction_and_confidence(
-                            logits=logits.view(current_block_x_draft.shape[0], -1, logits.shape[-1]), # (batch_size * current_block_draft_steps, current_block_end - current_block_start, vocab_size)
-                            mask_index=(current_block_x_draft == mask_token_id), # (batch_size * current_block_draft_steps, current_block_end - current_block_start)
+                        current_window_x0_draft, current_window_confidence_draft = self.get_mask_token_prediction_and_confidence(
+                            logits=logits.view(current_window_x_draft.shape[0], -1, logits.shape[-1]), # (batch_size * current_window_draft_steps, current_window_len, vocab_size)
+                            mask_index=(current_window_x_draft == mask_token_id), # (batch_size * current_window_draft_steps, current_window_len)
                             mask_token_id=mask_token_id,
                             temperature=temperature,
                             top_p=top_p,
                             top_k=top_k
                         )
 
-                        current_block_x_target = self.token_transfer(
-                            x=current_block_x_draft,
-                            x0=current_block_x0_draft,
-                            confidence=current_block_confidence_draft,
+                        current_window_x_target = self.token_transfer(
+                            x=current_window_x_draft,
+                            x0=current_window_x0_draft,
+                            confidence=current_window_confidence_draft,
                             confidence_priority_shift=confidence_priority_shift,
                             block_length=block_length,
                             mask_token_id=mask_token_id,
@@ -736,40 +740,40 @@ class DLM_Generator:
                         )
                         
                         # draft tokens verification
-                        current_block_x_draft = current_block_x_draft.view(current_block_x.shape[0], current_block_draft_steps, *current_block_x.shape[1:]) # [batch_size, current_block_draft_steps, current_block_end - current_block_start]
-                        current_block_x_target = current_block_x_target.view(current_block_x.shape[0], current_block_draft_steps, *current_block_x.shape[1:]) # [batch_size, current_block_draft_steps, current_block_end - current_block_start]
-                        matched_draft_index = (current_block_x_target[:, :-1, :] == current_block_x_draft[:, 1:, :]).all(dim=-1)
+                        current_window_x_draft = current_window_x_draft.view(current_window_x.shape[0], current_window_draft_steps, *current_window_x.shape[1:]) # [batch_size, current_window_draft_steps, current_window_len]
+                        current_window_x_target = current_window_x_target.view(current_window_x.shape[0], current_window_draft_steps, *current_window_x.shape[1:]) # [batch_size, current_window_draft_steps, current_window_len]
+                        matched_draft_index = (current_window_x_target[:, :-1, :] == current_window_x_draft[:, 1:, :]).all(dim=-1)
                         matched_steps = torch.cumprod(matched_draft_index, dim=-1).sum(dim=-1).item() # assume batch size is 1
 
                         # Update current x, current kv cache, and reuse intermediate results
                         total_accepted_steps += matched_steps
-                        total_draft_steps += current_block_draft_steps
+                        total_draft_steps += current_window_draft_steps
                         if eager_acceptance_mode:
                             # TODO: implement eager acceptance mode
                             pass
                         else:
-                            current_block_x = current_block_x_draft[:, matched_steps, :]
-                            newly_unmasked = current_block_mask_index & (current_block_x != mask_token_id)
+                            current_window_x = current_window_x_draft[:, matched_steps, :]
+                            newly_unmasked = current_window_mask_index & (current_window_x != mask_token_id)
                             trajectory_step_map[:, current_block_start:current_block_end][newly_unmasked] = global_step
                             global_step += 1
-                            current_block_x0 = current_block_x0_draft.view(batch_size, current_block_draft_steps, *current_block_x.shape[1:])[:, matched_steps, :]
-                            current_block_confidence = current_block_confidence_draft.view(batch_size, current_block_draft_steps, *current_block_x.shape[1:])[:, matched_steps, :]
+                            current_window_x0 = current_window_x0_draft.view(batch_size, current_window_draft_steps, *current_window_x.shape[1:])[:, matched_steps, :]
+                            current_window_confidence = current_window_confidence_draft.view(batch_size, current_window_draft_steps, *current_window_x.shape[1:])[:, matched_steps, :]
 
                         step += 1
 
-                if (current_block_x[:, :block_length] == mask_token_id).all():
+                if (current_window_x[:, :block_length] == mask_token_id).all():
                     # if the current block is all unmasked, store the current block's kv and exit the decoding loop
                     _, past_key_values, _ = self.get_processed_model_outputs(
-                        current_block_x[:, :block_length],
-                        current_block_attention_mask[..., :block_length, :current_block_start + block_length],
-                        current_block_position_ids[:, :block_length],
+                        current_window_x[:, :block_length],
+                        current_window_attention_mask[..., :block_length, :current_window_start + block_length],
+                        current_window_position_ids[:, :block_length],
                         past_key_values=past_key_values,
                         use_cache=True,
                         store_kv=True
                     )
                     break
 
-            # commit the current block to the sequence
-            x[:, current_block_start:current_block_end] = current_block_x
+            # commit the current block and future blocks (if any) to the sequence
+            x[:, current_window_start:current_window_end] = current_window_x
 
         return x, trajectory_step_map[:, prompt_length:prompt_length + max_gen_length]
