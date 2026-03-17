@@ -10,6 +10,7 @@ from deprecated import deprecated
 from .utils import sample_tokens
 import math
 from transformers.cache_utils import DynamicCache
+from .cache_utils import DynamicDualCache
 
 logger = logging.get_logger(__name__)
 
@@ -63,10 +64,9 @@ class DLM_Generator:
             )
             logits = model_output.logits
             logits = torch.cat([logits[:,:1], logits[:, :-1]], dim=1)
-            past_key_values = model_output.past_key_values if use_cache and hasattr(model_output, 'past_key_values') else None
             attentions = model_output.attentions if output_attentions and hasattr(model_output, 'attentions') else None
 
-            return logits, past_key_values, attentions
+            return logits, attentions
 
         else:
             model_output = self.model(
@@ -79,10 +79,9 @@ class DLM_Generator:
                 store_kv=store_kv
             )
             logits = model_output.logits
-            past_key_values = model_output.past_key_values if use_cache and hasattr(model_output, 'past_key_values') else None
             attentions = model_output.attentions if output_attentions and hasattr(model_output, 'attentions') else None
 
-            return logits, past_key_values, attentions
+            return logits, attentions
 
     def get_attention_mask_and_position_ids(
         self, 
@@ -286,16 +285,20 @@ class DLM_Generator:
             attention_type='full'
         )
         # past_key_values = None
-        past_key_values = DynamicCache()
 
         for block_idx in range(num_gen_blocks):
 
             current_block_start = prompt_length + block_idx * block_length
             current_block_end = current_block_start + block_length
-            current_block_x = x[:, current_block_start:current_block_end].clone()
 
             # update cache and decode the first step in the current block
-            logits, past_key_values, attentions = self.get_processed_model_outputs(
+            # reset cache to empty
+            if dual_cache:
+                past_key_values = DynamicDualCache()
+            else:
+                past_key_values = DynamicCache()
+            # update cache and get logits
+            logits, _ = self.get_processed_model_outputs(
                 x,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -303,56 +306,53 @@ class DLM_Generator:
                 use_cache=use_cache,
                 output_attentions=False
             )
-            confidence, x0 = sample_tokens(logits, temperature=1.0, top_k=None, top_p=None)
-            x[:, current_block_start] = x0[:, current_block_start] # we must always unmask the first token in the current block due to the logits shift of AR-adapted DLM
+            # always unmask the first token in the current block due to the logits shift of AR-adapted DLM
+            x0, confidence = sample_tokens(logits, temperature=temperature, top_k=top_k, top_p=top_p)
+            x[:, current_block_start] = x0[:, current_block_start]
                         
-            if not dual_cache: # Extract only previous block cache
-                new_past_key_values = []
-                for i in range(len(past_key_values)):
-                    new_past_key_values.append(())
-                    for j in range(len(past_key_values[i])):
-                        new_past_key_values[i] += (past_key_values[i][j][:, :current_block_start, :],)
-                past_key_values = new_past_key_values
-            else:
+            
+            if dual_cache: # Exclude the current block from the cache
+                # support dual cache (https://github.com/NVlabs/Fast-dLLM/blob/main/dream/model/modeling_dream.py) without modifying the modeling file
                 replace_position = torch.zeros_like(x, dtype=torch.bool)
                 replace_position[:, current_block_start:current_block_end] = 1
+                past_key_values.set_replace_position(replace_position)
+            else: # Extract only previous block cache
+                past_key_values.crop(current_block_start)
 
             # decoding loop for the current block
             step = 1
             while step < steps_per_block:
 
-                current_block_mask_index = (current_block_x == mask_token_id)
+                current_block_mask_index = (x[:, current_block_start:current_block_end] == mask_token_id)
                 
                 # Prepare attention mask for cached generation
-                if attention_mask != "full":
-                    # Adjust attention mask for current position
-                    current_attention_mask = attention_mask[:, :, :, current_block_start:]
+                if attention_mask != "full" and attention_mask is not None:
+                    current_attention_mask = attention_mask[:, :, current_block_start:, :]
                 else:
                     current_attention_mask = attention_mask
                 
                 if dual_cache:
-                    # only use the current block for forward pass
-                    logits, past_key_values, attentions = self.get_processed_model_outputs(
+                    # use the current block for forward pass
+                    logits, _ = self.get_processed_model_outputs(
                         x[:, current_block_start:current_block_end], 
                         current_attention_mask, 
-                        position_ids[:, current_block_start:current_block_end] if position_ids is not None else None, 
+                        torch.arange(current_block_start, current_block_end, device=x.device).unsqueeze(0), 
                         past_key_values=past_key_values, 
-                        use_cache=use_cache, 
-                        dual_cache=dual_cache, 
-                        replace_position=replace_position
+                        use_cache=use_cache
                     )
                 else:
                     # use the entire remaining sequence for forward pass
-                    logits, past_key_values, attentions = self.get_processed_model_outputs(
+                    logits, _ = self.get_processed_model_outputs(
                         x[:, current_block_start:], 
                         current_attention_mask, 
                         position_ids[:, current_block_start:] if position_ids is not None else None, 
                         past_key_values=past_key_values, 
                         use_cache=use_cache
                     )
+                    past_key_values.crop(current_block_start)
 
                 current_block_x0, current_block_confidence = self.get_mask_token_prediction_and_confidence(
-                    logits=logits[..., :block_length],
+                    logits=logits[:, :block_length, :],
                     mask_index=current_block_mask_index,
                     mask_token_id=mask_token_id,
                     temperature=temperature,
@@ -360,8 +360,8 @@ class DLM_Generator:
                     top_k=top_k
                 )
 
-                current_block_x = self.token_transfer(
-                    x=current_block_x,
+                x[:, current_block_start:current_block_end] = self.token_transfer(
+                    x=x[:, current_block_start:current_block_end],
                     x0=current_block_x0,
                     confidence=current_block_confidence,
                     block_length=block_length,
@@ -370,11 +370,10 @@ class DLM_Generator:
                     token_per_step=self.token_per_step,
                 )
 
-                if (current_block_x != mask_token_id).all():
-                    break
+                step += 1
 
-            # commit the current block to the sequence
-            x[:, current_block_start:current_block_end] = current_block_x
+                if (x[:, current_block_start:current_block_end] != mask_token_id).all():
+                    break
         
         return x
 
@@ -426,7 +425,7 @@ class DLM_Generator:
             num_blocks=num_total_blocks,
             attention_type='block_causal'
         )
-        past_key_values = None
+        past_key_values = DynamicCache()
 
         # Prefilling stage
         if prefill_length > 0:
@@ -435,7 +434,7 @@ class DLM_Generator:
             if cur_attn_mask.dim() == 3:
                 cur_attn_mask = cur_attn_mask[:, None, :, :]
             cur_position_ids = position_ids[:, :prefill_length]
-            logits, past_key_values, attentions = self.get_processed_model_outputs(
+            self.get_processed_model_outputs(
                 cur_x,
                 attention_mask=cur_attn_mask,
                 position_ids=cur_position_ids,
@@ -460,7 +459,7 @@ class DLM_Generator:
 
                 current_block_mask_index = (current_block_x == mask_token_id)
 
-                logits, _, _ = self.get_processed_model_outputs(
+                logits, _ = self.get_processed_model_outputs(
                     current_block_x,
                     attention_mask=current_block_attention_mask,
                     position_ids=current_block_position_ids,
@@ -490,7 +489,7 @@ class DLM_Generator:
 
                 if (current_block_x != mask_token_id).all():
                     # if the current block is all unmasked, store the current block's kv and exit the decoding loop
-                    _, past_key_values, _ = self.get_processed_model_outputs(
+                    self.get_processed_model_outputs(
                         current_block_x,
                         current_block_attention_mask,
                         current_block_position_ids,
@@ -555,7 +554,7 @@ class DLM_Generator:
             num_blocks=num_total_blocks,
             attention_type='block_causal'
         )
-        past_key_values = None
+        past_key_values = DynamicCache()
 
         # Prefilling stage
         if prefill_length > 0:
@@ -564,7 +563,7 @@ class DLM_Generator:
             if cur_attn_mask.dim() == 3:
                 cur_attn_mask = cur_attn_mask[:, None, :, :]
             cur_position_ids = position_ids[:, :prefill_length]
-            _, past_key_values, _ = self.get_processed_model_outputs(
+            self.get_processed_model_outputs(
                 cur_x,
                 attention_mask=cur_attn_mask,
                 position_ids=cur_position_ids,
@@ -604,7 +603,7 @@ class DLM_Generator:
 
             if current_window_mask_index[:, :block_length].sum() == 0:
                 # if the current block is all unmasked, store the current block's kv and proceed to the next block
-                _, past_key_values, _ = self.get_processed_model_outputs(
+                self.get_processed_model_outputs(
                     current_window_x[:, :block_length],
                     current_window_attention_mask[..., :block_length, :current_window_start + block_length],
                     current_window_position_ids[:, :block_length],
@@ -615,7 +614,7 @@ class DLM_Generator:
                 continue
 
             # first forward pass for the current block
-            logits, _, _ = self.get_processed_model_outputs(
+            logits, _ = self.get_processed_model_outputs(
                 current_window_x,
                 attention_mask=current_window_attention_mask,
                 position_ids=current_window_position_ids,
@@ -689,7 +688,7 @@ class DLM_Generator:
                     num_branches=current_window_draft_steps
                 )
 
-                logits, _, _ = self.get_processed_model_outputs(
+                logits, _ = self.get_processed_model_outputs(
                     current_window_x_draft.view(batch_size, -1), # (batch_size, current_window_len * current_window_draft_steps)
                     attention_mask=current_window_draft_blocks_tree_attention_mask,
                     position_ids=current_window_draft_blocks_tree_position_ids,
@@ -746,7 +745,7 @@ class DLM_Generator:
                     current_window_mask_index = (current_window_x == mask_token_id)
 
             # store the current block's kv
-            _, past_key_values, _ = self.get_processed_model_outputs(
+            self.get_processed_model_outputs(
                 current_window_x[:, :block_length],
                 current_window_attention_mask[..., :block_length, :current_window_start + block_length],
                 current_window_position_ids[:, :block_length],
