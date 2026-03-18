@@ -7,7 +7,7 @@ from transformers.cache_utils import Cache
 from transformers.utils import logging
 from typing import Optional, List, Union
 from deprecated import deprecated
-from .utils import sample_tokens
+from .sampling_utils import sample_tokens
 import math
 from transformers.cache_utils import DynamicCache
 from .cache_utils import DynamicDualCache
@@ -44,7 +44,6 @@ class DLM_Generator:
         store_kv: bool = False,
         output_attentions: bool = False,
         dual_cache: bool = False,
-        replace_position: Optional[torch.Tensor] = None
     ):
 
         '''
@@ -59,8 +58,7 @@ class DLM_Generator:
                 past_key_values, 
                 use_cache=use_cache, 
                 output_attentions=output_attentions,
-                dual_cache=dual_cache, 
-                replace_position=replace_position
+                dual_cache=dual_cache,
             )
             logits = model_output.logits
             logits = torch.cat([logits[:,:1], logits[:, :-1]], dim=1)
@@ -126,22 +124,69 @@ class DLM_Generator:
         num_branches: Optional[int] = None
     ):
         '''
-        Create tree-structured attention mask and position ids for a block tree.
-        TODO: support full attention DLM
+        Create tree-structured attention mask and position ids for draft-tree verification.
+        Supports both block-causal and full-attention settings.
         '''
-        if attention_mask.ndim == 4:
-            attn_mask = attention_mask.squeeze(0).squeeze(0)
-        assert attn_mask.ndim == 2, 'attention_mask must be 2D'
-        assert attn_mask.shape == (branch_length, shared_prefix_length + branch_length + shared_suffix_length), 'attention_mask must be of shape (branch_length, shared_prefix_length + branch_length + shared_suffix_length)'
-        
-        tree_attention_mask = torch.ones(branch_length * num_branches, shared_prefix_length + branch_length * num_branches + shared_suffix_length, device=attention_mask.device)
-        tree_attention_mask[:, shared_prefix_length:tree_attention_mask.shape[1]-shared_suffix_length] = torch.block_diag(*[attn_mask[:, shared_prefix_length:tree_attention_mask.shape[1]-shared_suffix_length]] * num_branches) 
+        if (
+            shared_prefix_length is None
+            or branch_length is None
+            or shared_suffix_length is None
+            or num_branches is None
+        ):
+            raise ValueError("Tree attention requires shared_prefix_length/branch_length/shared_suffix_length/num_branches.")
 
-        tree_position_ids = position_ids.repeat(1, num_branches) # (1, branch_length * num_branches)
+        expected_width = shared_prefix_length + branch_length + shared_suffix_length
 
-        # back to 4D tensor
+        if attention_mask is None:
+            attn_mask = torch.ones(
+                branch_length,
+                expected_width,
+                device=self.device,
+                dtype=torch.bool,
+            )
+        else:
+            if attention_mask.ndim == 4:
+                attn_mask = attention_mask.squeeze(0).squeeze(0)
+            elif attention_mask.ndim == 2:
+                attn_mask = attention_mask
+            else:
+                raise ValueError("attention_mask must be 2D or 4D when creating tree attention.")
+            if attn_mask.shape != (branch_length, expected_width):
+                raise ValueError(
+                    f"attention_mask shape mismatch: got {tuple(attn_mask.shape)}, "
+                    f"expected ({branch_length}, {expected_width})."
+                )
+
+        if position_ids is None:
+            position_ids = torch.arange(shared_prefix_length, shared_prefix_length + branch_length, device=self.device).unsqueeze(0)
+
+        tree_attention_mask = torch.zeros(
+            branch_length * num_branches,
+            shared_prefix_length + branch_length * num_branches + shared_suffix_length,
+            device=attn_mask.device,
+            dtype=attn_mask.dtype,
+        )
+
+        for branch_idx in range(num_branches):
+            row_start = branch_idx * branch_length
+            row_end = row_start + branch_length
+
+            if shared_prefix_length > 0:
+                tree_attention_mask[row_start:row_end, :shared_prefix_length] = attn_mask[:, :shared_prefix_length]
+
+            col_start = shared_prefix_length + branch_idx * branch_length
+            col_end = col_start + branch_length
+            tree_attention_mask[row_start:row_end, col_start:col_end] = attn_mask[
+                :, shared_prefix_length:shared_prefix_length + branch_length
+            ]
+
+            if shared_suffix_length > 0:
+                tree_attention_mask[row_start:row_end, -shared_suffix_length:] = attn_mask[
+                    :, shared_prefix_length + branch_length:
+                ]
+
+        tree_position_ids = position_ids.repeat(1, num_branches)
         tree_attention_mask = tree_attention_mask.unsqueeze(0).unsqueeze(0)
-
         return tree_attention_mask, tree_position_ids
 
 
@@ -311,11 +356,12 @@ class DLM_Generator:
             x[:, current_block_start] = x0[:, current_block_start]
                         
             
-            if dual_cache: # Exclude the current block from the cache
-                # support dual cache (https://github.com/NVlabs/Fast-dLLM/blob/main/dream/model/modeling_dream.py) without modifying the modeling file
-                replace_position = torch.zeros_like(x, dtype=torch.bool)
-                replace_position[:, current_block_start:current_block_end] = 1
-                past_key_values.set_replace_position(replace_position)
+            if dual_cache:
+                # Compose [prefix, current-block, suffix] on-the-fly from base cache.
+                past_key_values.set_dual_layout(
+                    prefix_end=current_block_start,
+                    suffix_start=current_block_end,
+                )
             else: # Extract only previous block cache
                 past_key_values.crop(current_block_start)
 
@@ -376,6 +422,249 @@ class DLM_Generator:
                     break
         
         return x
+
+    @torch.no_grad()
+    def block_decode_with_full_attention_FreeDave(
+        self, 
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.LongTensor],
+        temperature: float = 0.0,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None,
+        alg_temp: Optional[float] = None,
+        block_length: Optional[int] = 32,
+        max_gen_length: Optional[int] = 128,
+        decoding_steps: Optional[int] = 128,
+        draft_steps: Optional[int] = 1,
+        eager_acceptance_mode: Optional[bool] = False,
+        use_cache: bool = False,
+        mask_token_id: int = 151666,
+        eos_token_id: int = 151645,
+        pad_token_id: int = 151643,
+        pad_target_penalty: float = 1.0,
+        confidence_threshold: Optional[float] = None,
+        dual_cache: bool = False
+    ):
+        '''
+        block_decode_with_full_attention_FreeDave for full-attention DLMs.
+        Uses draft-and-verify with tree attention, while supporting:
+        1) prefix cache (DynamicCache) and
+        2) dual cache (DynamicDualCache).
+        '''
+
+        batch_size = input_ids.shape[0]
+        assert batch_size == 1, 'batch size must be 1 for FreeDave'
+
+        prompt_length = input_ids.shape[1]
+        max_length = prompt_length + max_gen_length
+        x = F.pad(input_ids, (0, max_gen_length), value=mask_token_id)
+        trajectory_step_map = torch.full((batch_size, max_length), -1, device=x.device, dtype=torch.long)
+
+        if block_length is None:
+            block_length = max_gen_length
+
+        assert max_gen_length % block_length == 0, 'max_gen_length {} must be divisible by block_length {}'.format(max_gen_length, block_length)
+        num_gen_blocks = max_gen_length // block_length
+
+        assert block_length % self.token_per_step == 0, 'block_length={} must be divisible by self.token_per_step={}'.format(block_length, self.token_per_step)
+        steps_per_block = block_length // self.token_per_step
+
+        attention_mask, position_ids = self.get_attention_mask_and_position_ids(
+            attention_mask=attention_mask,
+            max_length=max_length,
+            block_length=block_length,
+            num_blocks=num_gen_blocks,
+            attention_type='full'
+        )
+        global_step = 0
+
+        for block_idx in range(num_gen_blocks):
+
+            current_block_start = prompt_length + block_idx * block_length
+            current_block_end = current_block_start + block_length
+
+            if eager_acceptance_mode:
+                num_future_blocks = min(math.ceil(draft_steps / steps_per_block), num_gen_blocks - block_idx - 1)
+                confidence_priority_shift = torch.arange(num_future_blocks, -1, -1, device=x.device).repeat_interleave(block_length)
+            else:
+                num_future_blocks = 0
+                confidence_priority_shift = None
+
+            current_window_start = current_block_start
+            current_window_end = current_window_start + (num_future_blocks + 1) * block_length
+            current_window_len = current_window_end - current_window_start
+
+            # current_window_x = x[:, current_window_start:current_window_end].clone()
+            # current_window_mask_index = (current_window_x == mask_token_id)
+
+            # if current_window_mask_index[:, :block_length].sum() == 0:
+            #     continue
+
+            if dual_cache:
+                past_key_values = DynamicDualCache()
+            else:
+                past_key_values = DynamicCache()
+            # update cache and get logits
+            logits, _ = self.get_processed_model_outputs(
+                x,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                output_attentions=False
+            )
+            # always unmask the first token in the current block due to the logits shift of AR-adapted DLM
+            x0, confidence = sample_tokens(logits, temperature=temperature, top_k=top_k, top_p=top_p)
+            x[:, current_block_start] = x0[:, current_block_start]
+
+            if (x[:, current_block_start:current_block_end] != mask_token_id).all():
+                continue
+            
+            if dual_cache:
+                # Compose [prefix, current-window, suffix] from the frozen base cache.
+                past_key_values.set_dual_layout(
+                    prefix_end=current_window_start,
+                    suffix_start=current_window_end,
+                )
+            else: # Extract only previous block cache
+                past_key_values.crop(current_block_start)
+
+            current_window_mask_index = (x[:, current_window_start:current_window_end] == mask_token_id)
+
+            current_window_x0, current_window_confidence = self.get_mask_token_prediction_and_confidence(
+                logits=logits[:, current_window_start:current_window_end, :],
+                mask_index=current_window_mask_index,
+                mask_token_id=mask_token_id,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k
+            )
+
+            while True:
+
+                current_window_mask_index = (x[:, current_window_start:current_window_end] == mask_token_id)
+                current_window_draft_steps = min(draft_steps, math.ceil(current_window_mask_index.sum().item() / self.token_per_step))
+
+                current_window_x_draft = self.token_transfer(
+                    x=x[:, current_window_start:current_window_end],
+                    x0=current_window_x0,
+                    draft_steps=current_window_draft_steps,
+                    confidence=current_window_confidence,
+                    confidence_priority_shift=confidence_priority_shift,
+                    block_length=block_length,
+                    mask_token_id=mask_token_id,
+                    alg_temp=alg_temp,
+                    token_per_step=self.token_per_step,
+                )
+                assert current_window_x_draft.shape == (batch_size * current_window_draft_steps, current_window_len), 'current_window_x_draft.shape must be (batch_size * current_window_draft_steps, current_window_len), but got {}'.format(current_window_x_draft.shape)
+
+                if num_gen_blocks - block_idx == 1 and current_window_mask_index[:, :block_length].sum() <= self.token_per_step:
+                    x[:, current_window_start:current_window_end] = current_window_x_draft[::current_window_draft_steps]
+                    newly_unmasked = current_window_mask_index & (x[:, current_window_start:current_window_end] != mask_token_id)
+                    trajectory_step_map[:, current_window_start:current_window_end][newly_unmasked] = global_step
+                    global_step += 1
+                    break
+
+                if not eager_acceptance_mode and current_window_mask_index[:, :block_length].sum() <= self.token_per_step:
+                    x[:, current_window_start:current_window_end] = current_window_x_draft[::current_window_draft_steps]
+                    newly_unmasked = current_window_mask_index & (x[:, current_window_start:current_window_end] != mask_token_id)
+                    trajectory_step_map[:, current_window_start:current_window_end][newly_unmasked] = global_step
+                    global_step += 1
+                    break
+                
+                if dual_cache:
+                    tree_attention_mask, tree_position_ids = self.create_tree_attention_mask_and_position_ids(
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        shared_prefix_length=current_window_start,
+                        branch_length=current_window_len,
+                        shared_suffix_length=max_length-current_window_end,
+                        num_branches=current_window_draft_steps
+                    )
+                    logits, _ = self.get_processed_model_outputs(
+                        current_window_x_draft.view(batch_size, -1),
+                        attention_mask=tree_attention_mask,
+                        position_ids=tree_position_ids,
+                        past_key_values=past_key_values,
+                        use_cache=True,
+                        output_attentions=False
+                    )
+                    current_window_x0_draft, current_window_confidence_draft = self.get_mask_token_prediction_and_confidence(
+                        logits=logits.view(current_window_x_draft.shape[0], -1, logits.shape[-1]), # (batch_size * current_window_draft_steps, current_window_len, vocab_size)
+                        mask_index=(current_window_x_draft == mask_token_id),
+                        mask_token_id=mask_token_id,
+                        temperature=temperature,
+                        top_p=top_p,
+                        top_k=top_k
+                    )
+                
+                else:
+                    tree_attention_mask, tree_position_ids = self.create_tree_attention_mask_and_position_ids(
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        shared_prefix_length=current_window_start,
+                        branch_length=max_length-current_window_start,
+                        shared_suffix_length=0,
+                        num_branches=current_window_draft_steps
+                    )
+
+                    logits, _ = self.get_processed_model_outputs(
+                        torch.cat([current_window_x_draft, x[:, current_window_end:].expand(current_window_x_draft.shape[0], -1)], dim=-1).view(batch_size, -1),
+                        attention_mask=tree_attention_mask,
+                        position_ids=tree_position_ids,
+                        past_key_values=past_key_values,
+                        use_cache=True,
+                        output_attentions=False
+                    )
+                    past_key_values.crop(current_block_start)
+
+                    current_window_x0_draft, current_window_confidence_draft = self.get_mask_token_prediction_and_confidence(
+                        logits=logits.view(current_window_x_draft.shape[0], -1, logits.shape[-1])[:, :current_window_len, :],
+                        mask_index=(current_window_x_draft == mask_token_id),
+                        mask_token_id=mask_token_id,
+                        temperature=temperature,
+                        top_p=top_p,
+                        top_k=top_k
+                    )
+
+                current_window_x_target = self.token_transfer(
+                    x=current_window_x_draft,
+                    x0=current_window_x0_draft,
+                    confidence=current_window_confidence_draft,
+                    confidence_priority_shift=confidence_priority_shift,
+                    block_length=block_length,
+                    mask_token_id=mask_token_id,
+                    alg_temp=alg_temp,
+                    token_per_step=self.token_per_step,
+                )
+
+                current_window_x_draft = current_window_x_draft.view(
+                    batch_size, current_window_draft_steps, current_window_len
+                )
+                current_window_x_target = current_window_x_target.view(
+                    batch_size, current_window_draft_steps, current_window_len
+                )
+                matched_draft_index = (current_window_x_target[:, :-1, :] == current_window_x_draft[:, 1:, :]).all(dim=-1)
+                matched_steps = torch.cumprod(matched_draft_index, dim=-1).sum(dim=-1).item()
+
+                if eager_acceptance_mode and (current_window_x_draft[:, matched_steps, :block_length] != mask_token_id).all():
+                    x[:, current_window_start:current_window_end] = current_window_x_target[:, matched_steps, :]
+                else:
+                    x[:, current_window_start:current_window_end] = current_window_x_draft[:, matched_steps, :]
+                    newly_unmasked = current_window_mask_index & (x[:, current_window_start:current_window_end] != mask_token_id)
+                    trajectory_step_map[:, current_window_start:current_window_end][newly_unmasked] = global_step
+                    global_step += 1
+                    current_window_x0 = current_window_x0_draft.view(
+                        batch_size, current_window_draft_steps, current_window_len
+                    )[:, matched_steps, :]
+                    current_window_confidence = current_window_confidence_draft.view(
+                        batch_size, current_window_draft_steps, current_window_len
+                    )[:, matched_steps, :]
+
+                if (x[:, current_window_start:current_window_end] != mask_token_id).all():
+                    break
+
+        return x, trajectory_step_map[:, prompt_length:prompt_length + max_gen_length]
 
     @torch.no_grad()
     def block_decode_with_block_causal_attention(
