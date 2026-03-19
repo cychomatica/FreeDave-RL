@@ -15,18 +15,11 @@ from .cache_utils import DynamicDualCache
 logger = logging.get_logger(__name__)
 
 
-# def generate_FreeDave(model: PreTrainedModel, **kwargs):
-#     pass
-
 # TODO: support more AR-adapted DLM
 AR_ADAPTED_DLM = ['DreamModel', 'DreamBaseModel']
 
 
 class DLM_Generator:
-
-    '''
-        Notes: now only consider 1 token per step
-    '''
 
     def __init__(self, model: PreTrainedModel, generation_config: Optional[GenerationConfig] = None):
         self.model = model
@@ -381,8 +374,8 @@ class DLM_Generator:
                     # use the current block for forward pass
                     logits, _ = self.get_processed_model_outputs(
                         x[:, current_block_start:current_block_end], 
-                        current_attention_mask, 
-                        torch.arange(current_block_start, current_block_end, device=x.device).unsqueeze(0), 
+                        attention_mask=current_attention_mask, 
+                        position_ids=torch.arange(current_block_start, current_block_end, device=x.device).unsqueeze(0), 
                         past_key_values=past_key_values, 
                         use_cache=use_cache
                     )
@@ -390,8 +383,8 @@ class DLM_Generator:
                     # use the entire remaining sequence for forward pass
                     logits, _ = self.get_processed_model_outputs(
                         x[:, current_block_start:], 
-                        current_attention_mask, 
-                        position_ids[:, current_block_start:] if position_ids is not None else None, 
+                        attention_mask=current_attention_mask, 
+                        position_ids=position_ids[:, current_block_start:] if position_ids is not None else None, 
                         past_key_values=past_key_values, 
                         use_cache=use_cache
                     )
@@ -414,6 +407,7 @@ class DLM_Generator:
                     mask_token_id=mask_token_id,
                     alg_temp=alg_temp,
                     token_per_step=self.token_per_step,
+                    confidence_threshold=confidence_threshold
                 )
 
                 step += 1
@@ -437,6 +431,7 @@ class DLM_Generator:
         decoding_steps: Optional[int] = 128,
         draft_steps: Optional[int] = 1,
         eager_acceptance_mode: Optional[bool] = False,
+        draft_mode: Optional[str] = 'tree_attention',
         use_cache: bool = False,
         mask_token_id: int = 151666,
         eos_token_id: int = 151645,
@@ -516,6 +511,7 @@ class DLM_Generator:
             # always unmask the first token in the current block due to the logits shift of AR-adapted DLM
             x0, confidence = sample_tokens(logits, temperature=temperature, top_k=top_k, top_p=top_p)
             x[:, current_block_start] = x0[:, current_block_start]
+            trajectory_step_map[:, current_block_start] = global_step
 
             if (x[:, current_block_start:current_block_end] != mask_token_id).all():
                 continue
@@ -531,6 +527,7 @@ class DLM_Generator:
 
             current_window_mask_index = (x[:, current_window_start:current_window_end] == mask_token_id)
 
+            # reuse stale logits from the cache-update forward
             current_window_x0, current_window_confidence = self.get_mask_token_prediction_and_confidence(
                 logits=logits[:, current_window_start:current_window_end, :],
                 mask_index=current_window_mask_index,
@@ -539,23 +536,44 @@ class DLM_Generator:
                 top_p=top_p,
                 top_k=top_k
             )
+            step = 1
 
             while True:
 
                 current_window_mask_index = (x[:, current_window_start:current_window_end] == mask_token_id)
                 current_window_draft_steps = min(draft_steps, math.ceil(current_window_mask_index.sum().item() / self.token_per_step))
 
-                current_window_x_draft = self.token_transfer(
-                    x=x[:, current_window_start:current_window_end],
-                    x0=current_window_x0,
-                    draft_steps=current_window_draft_steps,
-                    confidence=current_window_confidence,
-                    confidence_priority_shift=confidence_priority_shift,
-                    block_length=block_length,
-                    mask_token_id=mask_token_id,
-                    alg_temp=alg_temp,
-                    token_per_step=self.token_per_step,
-                )
+                if step == 1:
+                    # one fewer draft if reuse the cache update logits
+                    if current_window_draft_steps > 1:
+                        current_window_x_draft = self.token_transfer(
+                            x=x[:, current_window_start:current_window_end],
+                            x0=current_window_x0,
+                            draft_steps=current_window_draft_steps-1,
+                            confidence=current_window_confidence,
+                            confidence_priority_shift=confidence_priority_shift,
+                            block_length=block_length,
+                            mask_token_id=mask_token_id,
+                            alg_temp=alg_temp,
+                            token_per_step=self.token_per_step,
+                        )
+                        # prepend the known-good current x as the first draft
+                        current_window_x_draft = torch.cat([x[:, current_window_start:current_window_end].clone(), current_window_x_draft], dim=0)
+                    else:
+                        current_window_x_draft = x[:, current_window_start:current_window_end].clone()
+                    
+                else:
+                    current_window_x_draft = self.token_transfer(
+                        x=x[:, current_window_start:current_window_end],
+                        x0=current_window_x0,
+                        draft_steps=current_window_draft_steps,
+                        confidence=current_window_confidence,
+                        confidence_priority_shift=confidence_priority_shift,
+                        block_length=block_length,
+                        mask_token_id=mask_token_id,
+                        alg_temp=alg_temp,
+                        token_per_step=self.token_per_step,
+                    )
                 assert current_window_x_draft.shape == (batch_size * current_window_draft_steps, current_window_len), 'current_window_x_draft.shape must be (batch_size * current_window_draft_steps, current_window_len), but got {}'.format(current_window_x_draft.shape)
 
                 if num_gen_blocks - block_idx == 1 and current_window_mask_index[:, :block_length].sum() <= self.token_per_step:
@@ -573,59 +591,107 @@ class DLM_Generator:
                     break
                 
                 if dual_cache:
-                    tree_attention_mask, tree_position_ids = self.create_tree_attention_mask_and_position_ids(
-                        attention_mask=attention_mask,
-                        position_ids=position_ids,
-                        shared_prefix_length=current_window_start,
-                        branch_length=current_window_len,
-                        shared_suffix_length=max_length-current_window_end,
-                        num_branches=current_window_draft_steps
-                    )
-                    logits, _ = self.get_processed_model_outputs(
-                        current_window_x_draft.view(batch_size, -1),
-                        attention_mask=tree_attention_mask,
-                        position_ids=tree_position_ids,
-                        past_key_values=past_key_values,
-                        use_cache=True,
-                        output_attentions=False
-                    )
-                    current_window_x0_draft, current_window_confidence_draft = self.get_mask_token_prediction_and_confidence(
-                        logits=logits.view(current_window_x_draft.shape[0], -1, logits.shape[-1]), # (batch_size * current_window_draft_steps, current_window_len, vocab_size)
-                        mask_index=(current_window_x_draft == mask_token_id),
-                        mask_token_id=mask_token_id,
-                        temperature=temperature,
-                        top_p=top_p,
-                        top_k=top_k
-                    )
-                
+
+                    if draft_mode == 'batch_expanding':
+                        past_key_values.batch_repeat_interleave(current_window_draft_steps)
+                        logits, _ = self.get_processed_model_outputs(
+                            current_window_x_draft,
+                            attention_mask=None,
+                            position_ids=torch.arange(current_window_start, current_window_end, device=x.device).unsqueeze(0).expand(batch_size * current_window_draft_steps, -1),
+                            past_key_values=past_key_values,
+                            use_cache=True,
+                            output_attentions=False
+                        )
+                        past_key_values.batch_select_indices(torch.arange(0, current_window_x_draft.shape[0], current_window_draft_steps))
+
+                        current_window_x0_draft, current_window_confidence_draft = self.get_mask_token_prediction_and_confidence(
+                            logits=logits,
+                            mask_index=(current_window_x_draft == mask_token_id),
+                            mask_token_id=mask_token_id,
+                            temperature=temperature,
+                            top_p=top_p,
+                            top_k=top_k
+                        )
+                    elif draft_mode == 'tree_attention':
+                        tree_attention_mask, tree_position_ids = self.create_tree_attention_mask_and_position_ids(
+                            attention_mask=attention_mask,
+                            position_ids=position_ids,
+                            shared_prefix_length=current_window_start,
+                            branch_length=current_window_len,
+                            shared_suffix_length=max_length-current_window_end,
+                            num_branches=current_window_draft_steps
+                        )
+                        logits, _ = self.get_processed_model_outputs(
+                            current_window_x_draft.view(batch_size, -1),
+                            attention_mask=tree_attention_mask,
+                            position_ids=tree_position_ids,
+                            past_key_values=past_key_values,
+                            use_cache=True,
+                            output_attentions=False
+                        )
+                        current_window_x0_draft, current_window_confidence_draft = self.get_mask_token_prediction_and_confidence(
+                            logits=logits.view(current_window_x_draft.shape[0], -1, logits.shape[-1]),
+                            mask_index=(current_window_x_draft == mask_token_id),
+                            mask_token_id=mask_token_id,
+                            temperature=temperature,
+                            top_p=top_p,
+                            top_k=top_k
+                        )
+                    else:
+                        raise ValueError(f'Invalid draft mode: {draft_mode}. Please choose from "batch_expanding" or "tree_attention".')
                 else:
-                    tree_attention_mask, tree_position_ids = self.create_tree_attention_mask_and_position_ids(
-                        attention_mask=attention_mask,
-                        position_ids=position_ids,
-                        shared_prefix_length=current_window_start,
-                        branch_length=max_length-current_window_start,
-                        shared_suffix_length=0,
-                        num_branches=current_window_draft_steps
-                    )
+                    if draft_mode == 'batch_expanding':
+                        past_key_values.batch_repeat_interleave(current_window_draft_steps)
+                        logits, _ = self.get_processed_model_outputs(
+                            torch.cat([current_window_x_draft, x[:, current_window_end:].expand(current_window_x_draft.shape[0], -1)], dim=-1),
+                            attention_mask=attention_mask,
+                            position_ids=position_ids[:, current_block_start:] if position_ids is not None else None, 
+                            past_key_values=past_key_values,
+                            use_cache=True,
+                            output_attentions=False
+                        )
+                        past_key_values.batch_select_indices(torch.arange(0, current_window_x_draft.shape[0], current_window_draft_steps))
+                        past_key_values.crop(current_block_start)
 
-                    logits, _ = self.get_processed_model_outputs(
-                        torch.cat([current_window_x_draft, x[:, current_window_end:].expand(current_window_x_draft.shape[0], -1)], dim=-1).view(batch_size, -1),
-                        attention_mask=tree_attention_mask,
-                        position_ids=tree_position_ids,
-                        past_key_values=past_key_values,
-                        use_cache=True,
-                        output_attentions=False
-                    )
-                    past_key_values.crop(current_block_start)
+                        current_window_x0_draft, current_window_confidence_draft = self.get_mask_token_prediction_and_confidence(
+                            logits=logits[:, :current_window_len, :],
+                            mask_index=(current_window_x_draft == mask_token_id),
+                            mask_token_id=mask_token_id,
+                            temperature=temperature,
+                            top_p=top_p,
+                            top_k=top_k
+                        )
 
-                    current_window_x0_draft, current_window_confidence_draft = self.get_mask_token_prediction_and_confidence(
-                        logits=logits.view(current_window_x_draft.shape[0], -1, logits.shape[-1])[:, :current_window_len, :],
-                        mask_index=(current_window_x_draft == mask_token_id),
-                        mask_token_id=mask_token_id,
-                        temperature=temperature,
-                        top_p=top_p,
-                        top_k=top_k
-                    )
+                    elif draft_mode == 'tree_attention':
+                        tree_attention_mask, tree_position_ids = self.create_tree_attention_mask_and_position_ids(
+                            attention_mask=attention_mask,
+                            position_ids=position_ids,
+                            shared_prefix_length=current_window_start,
+                            branch_length=max_length-current_window_start,
+                            shared_suffix_length=0,
+                            num_branches=current_window_draft_steps
+                        )
+
+                        logits, _ = self.get_processed_model_outputs(
+                            torch.cat([current_window_x_draft, x[:, current_window_end:].expand(current_window_x_draft.shape[0], -1)], dim=-1).view(batch_size, -1),
+                            attention_mask=tree_attention_mask,
+                            position_ids=tree_position_ids,
+                            past_key_values=past_key_values,
+                            use_cache=True,
+                            output_attentions=False
+                        )
+                        past_key_values.crop(current_block_start)
+
+                        current_window_x0_draft, current_window_confidence_draft = self.get_mask_token_prediction_and_confidence(
+                            logits=logits.view(current_window_x_draft.shape[0], -1, logits.shape[-1])[:, :current_window_len, :],
+                            mask_index=(current_window_x_draft == mask_token_id),
+                            mask_token_id=mask_token_id,
+                            temperature=temperature,
+                            top_p=top_p,
+                            top_k=top_k
+                        )
+
+                step += 1
 
                 current_window_x_target = self.token_transfer(
                     x=current_window_x_draft,
@@ -652,8 +718,9 @@ class DLM_Generator:
                 else:
                     x[:, current_window_start:current_window_end] = current_window_x_draft[:, matched_steps, :]
                     newly_unmasked = current_window_mask_index & (x[:, current_window_start:current_window_end] != mask_token_id)
-                    trajectory_step_map[:, current_window_start:current_window_end][newly_unmasked] = global_step
-                    global_step += 1
+                    if newly_unmasked.any():
+                        trajectory_step_map[:, current_window_start:current_window_end][newly_unmasked] = global_step
+                        global_step += 1
                     current_window_x0 = current_window_x0_draft.view(
                         batch_size, current_window_draft_steps, current_window_len
                     )[:, matched_steps, :]
@@ -664,7 +731,10 @@ class DLM_Generator:
                 if (x[:, current_window_start:current_window_end] != mask_token_id).all():
                     break
 
-        return x, trajectory_step_map[:, prompt_length:prompt_length + max_gen_length]
+        generated_trajectory_step_map = trajectory_step_map[:, prompt_length:prompt_length + max_gen_length]
+        assert (generated_trajectory_step_map >= 0).all(), 'Undecoded positions found: {}.'.format((generated_trajectory_step_map < 0).nonzero())
+
+        return x, generated_trajectory_step_map
 
     @torch.no_grad()
     def block_decode_with_block_causal_attention(
@@ -807,6 +877,7 @@ class DLM_Generator:
         decoding_steps: Optional[int] = 128,
         draft_steps: Optional[int] = 1,
         eager_acceptance_mode: Optional[bool] = False,
+        draft_mode: Optional[str] = 'tree_attention',
         use_cache: bool = False,
         mask_token_id: int = 151669,
         eos_token_id: int = 151643,
@@ -816,8 +887,14 @@ class DLM_Generator:
     ):
 
         '''
-        block_decode_with_block_causal_attention_FreeDave (https://arxiv.org/abs/2510.00294) for block-causal models like SDAR and TraDo
-        NOTE: now only consider 1 token per step; all the token transfer operations are performed in the block region. 
+        FreeDave (https://arxiv.org/abs/2510.00294) for block-causal DLMs like SDAR and TraDo. 
+        NOTE: now only consider 1-token-per-step transition by default. 
+
+        Currently support two draft modes:
+        - batch_expanding (v1): expand kv cache to match the batch_size of draft blocks, which requires more memory overhead but supports flash attention
+        - tree_attention (v2): use tree attention (https://arxiv.org/abs/2401.10774) instead of expanding kv cache to further reduce memory overhead, but flash attention is not supported due to the non-null attention mask (https://github.com/pytorch/pytorch/blob/9594ae448e70a3503c5a483369f803810d20a5be/aten/src/ATen/native/transformers/sdp_utils_cpp.h#L259)
+
+        Although v1 supports flash attention, v2 has lower memory overhead and is empirically a bit faster. 
         '''
 
         batch_size = input_ids.shape[0]
@@ -874,6 +951,8 @@ class DLM_Generator:
                 num_future_blocks = 0
                 confidence_priority_shift = None
 
+
+            # TODO: dynamic allocate future blocks instead of static allocation; allocate only when the number of masked tokens in the current block is smaller than the draft steps
             current_block_start = block_idx * block_length
             current_block_end = current_block_start + block_length
 
@@ -923,15 +1002,6 @@ class DLM_Generator:
             
             # decoding loop for the current block
             while True:
-            # for step in range(steps_per_block):
-
-                # current_window_mask_index = (current_window_x == mask_token_id)
-                # current_block_mask_index = current_window_mask_index[:, :block_length]
-
-                # if num_total_blocks - block_idx > 1 and num_future_blocks > 0:
-                #     current_window_draft_steps = min(draft_steps, steps_per_block * num_future_blocks)
-                # else:
-                    # current_window_draft_steps = min(draft_steps, steps_per_block - step)
 
                 current_window_draft_steps = min(draft_steps, math.ceil(current_window_mask_index.sum().item() / self.token_per_step))
 
@@ -967,33 +1037,57 @@ class DLM_Generator:
                     break
 
                 # batch forward the draft blocks
-                # v2: use tree attention (https://arxiv.org/abs/2401.10774) instead of expanding kv cache to further reduce memory overhead
-                current_window_draft_blocks_tree_attention_mask, current_window_draft_blocks_tree_position_ids = self.create_tree_attention_mask_and_position_ids(
-                    attention_mask=current_window_attention_mask,
-                    position_ids=current_window_position_ids,
-                    shared_prefix_length=current_window_start,
-                    branch_length=current_window_len,
-                    shared_suffix_length=0,
-                    num_branches=current_window_draft_steps
-                )
+                if draft_mode == 'batch_expanding':
+                    past_key_values.batch_repeat_interleave(current_window_draft_steps)
+                    logits, _ = self.get_processed_model_outputs(
+                        current_window_x_draft, # (batch_size * current_window_draft_steps, current_window_len)
+                        attention_mask=current_window_attention_mask,
+                        position_ids=current_window_position_ids,
+                        past_key_values=past_key_values,
+                        use_cache=True,
+                        store_kv=False
+                    ) # (batch_size * current_window_draft_steps, current_window_len, vocab_size)
+                    past_key_values.batch_select_indices(torch.arange(0, current_window_x_draft.shape[0], current_window_draft_steps))
 
-                logits, _ = self.get_processed_model_outputs(
-                    current_window_x_draft.view(batch_size, -1), # (batch_size, current_window_len * current_window_draft_steps)
-                    attention_mask=current_window_draft_blocks_tree_attention_mask,
-                    position_ids=current_window_draft_blocks_tree_position_ids,
-                    past_key_values=past_key_values,
-                    use_cache=True,
-                    store_kv=False
-                ) # (batch_size, current_window_len * current_window_draft_steps, vocab_size)
+                    current_window_x0_draft, current_window_confidence_draft = self.get_mask_token_prediction_and_confidence(
+                        logits=logits, # (batch_size * current_window_draft_steps, current_window_len, vocab_size)
+                        mask_index=(current_window_x_draft == mask_token_id), # (batch_size * current_window_draft_steps, current_window_len)
+                        mask_token_id=mask_token_id,
+                        temperature=temperature,
+                        top_p=top_p,
+                        top_k=top_k
+                    )
 
-                current_window_x0_draft, current_window_confidence_draft = self.get_mask_token_prediction_and_confidence(
-                    logits=logits.view(current_window_x_draft.shape[0], -1, logits.shape[-1]), # (batch_size * current_window_draft_steps, current_window_len, vocab_size)
-                    mask_index=(current_window_x_draft == mask_token_id), # (batch_size * current_window_draft_steps, current_window_len)
-                    mask_token_id=mask_token_id,
-                    temperature=temperature,
-                    top_p=top_p,
-                    top_k=top_k
-                )
+                
+                elif draft_mode == 'tree_attention':
+                    current_window_draft_blocks_tree_attention_mask, current_window_draft_blocks_tree_position_ids = self.create_tree_attention_mask_and_position_ids(
+                        attention_mask=current_window_attention_mask,
+                        position_ids=current_window_position_ids,
+                        shared_prefix_length=current_window_start,
+                        branch_length=current_window_len,
+                        shared_suffix_length=0,
+                        num_branches=current_window_draft_steps
+                    )
+
+                    logits, _ = self.get_processed_model_outputs(
+                        current_window_x_draft.view(batch_size, -1), # (batch_size, current_window_len * current_window_draft_steps)
+                        attention_mask=current_window_draft_blocks_tree_attention_mask,
+                        position_ids=current_window_draft_blocks_tree_position_ids,
+                        past_key_values=past_key_values,
+                        use_cache=True,
+                        store_kv=False
+                    ) # (batch_size, current_window_len * current_window_draft_steps, vocab_size)
+
+                    current_window_x0_draft, current_window_confidence_draft = self.get_mask_token_prediction_and_confidence(
+                        logits=logits.view(current_window_x_draft.shape[0], -1, logits.shape[-1]), # (batch_size * current_window_draft_steps, current_window_len, vocab_size)
+                        mask_index=(current_window_x_draft == mask_token_id), # (batch_size * current_window_draft_steps, current_window_len)
+                        mask_token_id=mask_token_id,
+                        temperature=temperature,
+                        top_p=top_p,
+                        top_k=top_k
+                    )
+                else:
+                    raise ValueError(f'Invalid draft mode: {draft_mode}. Please choose from "batch_expanding" or "tree_attention".')
 
                 current_window_x_target = self.token_transfer(
                     x=current_window_x_draft,
@@ -1045,47 +1139,7 @@ class DLM_Generator:
             # commit the current block and future blocks (if any) to the sequence
             x[:, current_window_start:current_window_end] = current_window_x
 
-        return x, trajectory_step_map[:, prompt_length:prompt_length + max_gen_length]
+        generated_trajectory_step_map = trajectory_step_map[:, prompt_length:prompt_length + max_gen_length]
+        assert (generated_trajectory_step_map >= 0).all(), 'Undecoded positions found: {}.'.format((generated_trajectory_step_map < 0).nonzero())
 
-
-    @deprecated('This function will be deprecated in v2, where tree attention is used for a more efficient implementation.')
-    @torch.no_grad()
-    def cache_batch_repeat_interleave(past_key_values, n):
-        '''
-            past_key_values: 
-            a list of n_heads tuples (key, value)
-            key: (batch, seq_len, head_dim)
-            value: (batch, seq_len, head_dim)
-
-            new_past_key_values:
-            a list of n_heads tuples (key, value)
-            key: (batch * n, seq_len, head_dim)
-            value: (batch * n, seq_len, head_dim)
-        '''
-        new_past_key_values = []
-        for i in range(len(past_key_values)):
-            new_past_key_values.append(())
-            for j in range(len(past_key_values[i])):
-                new_past_key_values[i] += (past_key_values[i][j].expand(n, *past_key_values[i][j].shape[1:]),)
-        return new_past_key_values
-
-    @deprecated('This function will be deprecated in v2, where tree attention is used for a more efficient implementation.')
-    @torch.no_grad()
-    def cache_batch_select_indices(past_key_values, indices):
-        '''
-            past_key_values: 
-            a list of n_heads tuples (key, value)
-            key: (batch, seq_len, head_dim)
-            value: (batch, seq_len, head_dim)
-
-            new_past_key_values:
-            a list of n_heads tuples (key, value)
-            key: (batch, seq_len, head_dim)
-            value: (batch, seq_len, head_dim)
-        '''
-        new_past_key_values = []
-        for i in range(len(past_key_values)):
-            new_past_key_values.append(())
-            for j in range(len(past_key_values[i])):
-                new_past_key_values[i] += (past_key_values[i][j][indices, ...],)
-        return new_past_key_values
+        return x, generated_trajectory_step_map
