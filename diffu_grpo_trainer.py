@@ -1,4 +1,5 @@
 import torch
+from types import MethodType
 from trl.trainer.grpo_trainer import GRPOTrainer
 from typing import Any, Callable, Optional, Union, Sized, List
 import numpy as np
@@ -8,9 +9,8 @@ import warnings
 import torch.nn.functional as F
 from trl.trainer.grpo_config import GRPOConfig
 from trl.extras.profiling import profiling_decorator, profiling_context
-from transformers.utils import is_peft_available
+from transformers.utils import is_peft_available, is_rich_available
 from torch import nn
-from trl.import_utils import is_rich_available, is_vllm_available
 from accelerate.utils import broadcast_object_list, gather, gather_object, is_peft_model, set_seed
 from trl.data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
 from trl.models import create_reference_model, prepare_deepspeed, unwrap_model_for_generation
@@ -24,13 +24,34 @@ from trl.trainer.utils import (
 import wandb
 import os
 
-from generation.generate import generate_FreeDave
+from generation.generate import DLMGeneration
 
 if is_peft_available():
     from peft import PeftConfig, get_peft_model
 # What we call a reward function is a callable that takes a list of prompts and completions and returns a list of
 # rewards. When it's a string, it's a model ID, so it's loaded as a pretrained model.
 RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
+
+
+def _ensure_prepare_inputs_for_generation(model: PreTrainedModel) -> None:
+    """PEFT PeftModelForCausalLM requires this hook on the base module at wrap time.
+
+    Dream-org checkpoints use DreamGenerationMixin (diffusion) and omit the standard
+    transformers `prepare_inputs_for_generation` used by autoregressive LMs.
+    """
+    if getattr(model, "prepare_inputs_for_generation", None) is not None:
+        return
+
+    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask=None, **kwargs):
+        model_inputs = dict(kwargs)
+        model_inputs["input_ids"] = input_ids
+        if attention_mask is not None:
+            model_inputs["attention_mask"] = attention_mask
+        if past_key_values is not None:
+            model_inputs["past_key_values"] = past_key_values
+        return model_inputs
+
+    model.prepare_inputs_for_generation = MethodType(prepare_inputs_for_generation, model)
 
 
 class DiffuGRPOTrainer(GRPOTrainer):
@@ -66,7 +87,10 @@ class DiffuGRPOTrainer(GRPOTrainer):
             None,
         ),
         peft_config: Optional["PeftConfig"] = None,
+        **kwargs
     ):
+        if peft_config is not None and not isinstance(model, str):
+            _ensure_prepare_inputs_for_generation(model)
         # Initialize the parent class
         super().__init__(
             model=model,
@@ -80,6 +104,8 @@ class DiffuGRPOTrainer(GRPOTrainer):
             optimizers=optimizers,
             peft_config=peft_config,
         )
+
+        self.dlm_generation = DLMGeneration()
 
     @profiling_decorator
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
@@ -118,7 +144,9 @@ class DiffuGRPOTrainer(GRPOTrainer):
             else per_token_logps.detach()
         )
         coef_1 = torch.exp(per_token_logps - old_per_token_logps)
-        coef_2 = torch.clamp(coef_1, 1 - self.epsilon, 1 + self.epsilon)
+        coef_2 = torch.clamp(coef_1, 1 - self.epsilon_low, 1 + self.epsilon_high)
+        if self.args.delta is not None:
+            coef_1 = torch.clamp(coef_1, max=self.args.delta)
         per_token_loss1 = coef_1 * advantages.unsqueeze(1)
         per_token_loss2 = coef_2 * advantages.unsqueeze(1)
         per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
@@ -252,12 +280,22 @@ class DiffuGRPOTrainer(GRPOTrainer):
         steps=128,
         gen_length=128,
         block_length=128,
-        temperature=0.0,
-        cfg_scale=0.0,
-        remasking="low_confidence",
-        mask_id=126336,
+        temperature=0.0
     ):
-        return generate_FreeDave(model, prompt, steps, gen_length, block_length, temperature, cfg_scale, remasking, mask_id)
+        return self.dlm_generation.block_decode_with_full_attention_FreeDave(
+                model=model,
+                input_ids=prompt,
+                temperature=temperature,
+                block_length=block_length,
+                max_gen_length=gen_length,
+                decoding_steps=steps,
+                draft_steps=4,
+                eager_acceptance_mode=True,
+                draft_mode='tree_attention',
+                use_cache=True,
+                dual_cache=True,
+                mask_token_id=self.args.mask_id,
+            )
 
     def forward_process(self, batch, prompt_index, mask_id, seed=None):
         set_seed(seed)
@@ -445,19 +483,69 @@ class DiffuGRPOTrainer(GRPOTrainer):
         per_token_logps = per_token_logps.to(torch.float32)
         return per_token_logps
 
+    def _shuffle_diffu_grpo_batch(
+        self, batch: dict[str, Union[torch.Tensor, Any]]
+    ) -> dict[str, Union[torch.Tensor, Any]]:
+        """Same permutation on batch; `trajectory_step_indices` and 3D logps use batch on dim 1."""
+        b = batch["prompt_ids"].shape[0]
+        perm = torch.randperm(b, device=batch["prompt_ids"].device)
+        out: dict[str, Union[torch.Tensor, Any]] = {}
+        for key, val in batch.items():
+            if val is None or not isinstance(val, torch.Tensor):
+                out[key] = val
+            elif key == "trajectory_step_indices":
+                out[key] = val[:, perm]
+            elif key in ("old_per_token_logps", "ref_per_token_logps") and val.dim() == 3:
+                out[key] = val[:, perm, :]
+            else:
+                out[key] = val[perm]
+        return out
+
+    def _split_diffu_grpo_batch(
+        self, batch: dict[str, Union[torch.Tensor, Any]], num_chunks: int
+    ) -> list[dict[str, Union[torch.Tensor, Any]]]:
+        """Split batch dim 0; slice dim 1 for `[num_itr, B, ...]` tensors."""
+        batch_size = batch["prompt_ids"].shape[0]
+        if batch_size % num_chunks != 0:
+            raise ValueError(
+                f"Generation batch size {batch_size} must be divisible by steps_per_generation={num_chunks}."
+            )
+        c = batch_size // num_chunks
+        chunks: list[dict[str, Union[torch.Tensor, Any]]] = []
+        for i in range(num_chunks):
+            sl = slice(i * c, (i + 1) * c)
+            piece: dict[str, Union[torch.Tensor, Any]] = {}
+            for key, val in batch.items():
+                if val is None or not isinstance(val, torch.Tensor):
+                    piece[key] = val
+                elif key == "trajectory_step_indices":
+                    piece[key] = val[:, sl]
+                elif key in ("old_per_token_logps", "ref_per_token_logps") and val.dim() == 3:
+                    piece[key] = val[:, sl, :]
+                else:
+                    piece[key] = val[sl]
+            chunks.append(piece)
+        return chunks
+
+    @profiling_decorator
     def _prepare_inputs(
         self, inputs: dict[str, Union[torch.Tensor, Any]]
     ) -> dict[str, Union[torch.Tensor, Any]]:
-        mode = "eval" if self.control.should_evaluate else "train"
+        # Match TRL GRPOTrainer: dataloader yields per_device × steps_per_generation; generate once, split, reuse.
+        # Cannot use TRL split_tensor_dict/shuffle_tensor_dict: trajectory_step_indices is [num_itr, B] and
+        # old/ref logps are [num_itr, B, L] (batch on dim 1).
+        mode = "train" if self.model.training else "eval"
         if mode == "train":
-            if self.state.global_step % self.num_iterations == 0:
-                inputs = self._generate_and_score_completions(inputs)
-                self._buffered_inputs[self._step % self.args.gradient_accumulation_steps] = inputs
-            else:
-                inputs = self._buffered_inputs[self._step % self.args.gradient_accumulation_steps]
+            generate_every = self.args.steps_per_generation * self.num_iterations
+            if self._step % generate_every == 0 or self._buffered_inputs is None:
+                generation_batch = self._generate_and_score_completions(inputs)
+                generation_batch = self._shuffle_diffu_grpo_batch(generation_batch)
+                self._buffered_inputs = self._split_diffu_grpo_batch(
+                    generation_batch, self.args.steps_per_generation
+                )
+            inputs = self._buffered_inputs[self._step % self.args.steps_per_generation]
             self._step += 1
         else:
-            # In evaluation, we don't reuse completions across multiple updates, so we don't need to buffer inputs.
             inputs = self._generate_and_score_completions(inputs)
         return inputs
 
@@ -512,9 +600,9 @@ class DiffuGRPOTrainer(GRPOTrainer):
                     gen_length=gen_length,
                     block_length=block_length,
                     temperature=temperature,
-                    cfg_scale=cfg_scale,
-                    remasking=self.args.remasking,
-                    mask_id=self.args.mask_id,
+                    # cfg_scale=cfg_scale,
+                    # remasking=self.args.remasking,
+                    # mask_id=self.args.mask_id,
                 )
                 # batch_prompt_completion_ids: [1, seq_len], batch_trajectory_step_map: [1, gen_length]
                 prompt_completion_ids_all.append(batch_prompt_completion_ids)
@@ -553,7 +641,11 @@ class DiffuGRPOTrainer(GRPOTrainer):
                     self.num_iterations, -1, -1
                 )
                 old_per_token_logps = self._get_per_token_logps_from_trajectory(
-                    self.model, prompt_completion_ids_expanded, logits_to_keep, trajectory_step_indices, trajectory_step_map
+                    self.model,
+                    prompt_completion_ids_expanded,
+                    logits_to_keep,
+                    trajectory_step_map,
+                    trajectory_step_indices,
                 )
                 all_old_per_token_logps = old_per_token_logps
             else:
@@ -564,7 +656,11 @@ class DiffuGRPOTrainer(GRPOTrainer):
             else:
                 with self.accelerator.unwrap_model(self.model).disable_adapter():
                     ref_per_token_logps = self._get_per_token_logps_from_trajectory(
-                        self.model, prompt_completion_ids_expanded, logits_to_keep, trajectory_step_indices, trajectory_step_map
+                        self.model,
+                        prompt_completion_ids_expanded,
+                        logits_to_keep,
+                        trajectory_step_map,
+                        trajectory_step_indices,
                     )
                     all_ref_per_token_logps = ref_per_token_logps
 

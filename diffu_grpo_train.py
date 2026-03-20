@@ -99,7 +99,7 @@ def main(grpo_config, model_config):
         r=model_config.lora_r,
         lora_alpha=model_config.lora_alpha,
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "up_proj", "down_proj", "gate_proj"],
-        task_type="CAUSAL_LM",
+        task_type=model_config.lora_task_type,
         lora_dropout=model_config.lora_dropout,
     )
     # Initialize and run trainer
@@ -109,6 +109,7 @@ def main(grpo_config, model_config):
         peft_config=peft_config,
         reward_funcs=reward_functions,
         train_dataset=train_set,
+        mask_token_id=grpo_config.mask_id,
     )
 
     if grpo_config.save_steps % grpo_config.num_iterations != 0:

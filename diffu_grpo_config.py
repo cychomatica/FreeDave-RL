@@ -13,8 +13,10 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Union
 
+import transformers
+from packaging import version
 from transformers import TrainingArguments
 
 
@@ -139,12 +141,22 @@ class DiffuGRPOConfig(TrainingArguments):
             installed, it prints the sample. If `wandb` logging is enabled, it logs it to `wandb`.
     """
 
+    if version.parse(transformers.__version__) >= version.parse("4.51.0"):
+        _VALID_DICT_FIELDS = TrainingArguments._VALID_DICT_FIELDS + ["model_init_kwargs"]
+
     # Parameters that control the model and reference model
-    model_init_kwargs: Optional[dict] = field(
+    model_init_kwargs: Optional[Union[dict, str]] = field(
         default=None,
         metadata={
             "help": "Keyword arguments for `transformers.AutoModelForCausalLM.from_pretrained`, used when the `model` "
             "argument of the `GRPOTrainer` is provided as a string."
+        },
+    )
+    disable_dropout: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to disable dropout in the model. This is useful for training with a reference model, as it "
+            "prevents the model from generating different logprobs for the same input."
         },
     )
 
@@ -187,6 +199,10 @@ class DiffuGRPOConfig(TrainingArguments):
             "exceed the VRAM capacity of a single GPU, albeit at the cost of slower generation. Disabling this option "
             "is not compatible with vLLM generation."
         },
+    )
+    shuffle_dataset: Optional[bool] = field(
+        default=True,
+        metadata={"help": "Whether to shuffle the training dataset."},
     )
 
     # Parameters that control generation
@@ -231,6 +247,19 @@ class DiffuGRPOConfig(TrainingArguments):
             "help": "Implementation of the cache method for faster generation when use_vllm is set to False."
         },
     )
+    generation_kwargs: Optional[dict] = field(
+        default=None,
+        metadata={
+            "help": "Additional keyword arguments for GenerationConfig / vLLM SamplingParams when sampling completions."
+        },
+    )
+    steps_per_generation: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "Number of optimization steps per generation. If `None`, derived from generation batch settings "
+            "(see TRL GRPOConfig)."
+        },
+    )
 
     # Parameters that control generation acceleration powered by vLLM
     use_vllm: Optional[bool] = field(
@@ -241,6 +270,30 @@ class DiffuGRPOConfig(TrainingArguments):
             "(`pip install vllm`)."
         },
     )
+    vllm_mode: str = field(
+        default="server",
+        metadata={
+            "help": "vLLM integration mode when use_vllm is True: 'server' (TRL vllm-serve) or 'colocate'."
+        },
+    )
+    vllm_server_base_url: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Base URL for the vLLM server. If set, vllm_server_host and vllm_server_port are ignored."
+        },
+    )
+    vllm_server_host: str = field(
+        default="0.0.0.0",
+        metadata={"help": "Host of the vLLM server when vllm_mode is server."},
+    )
+    vllm_server_port: int = field(
+        default=8000,
+        metadata={"help": "Port of the vLLM server when vllm_mode is server."},
+    )
+    vllm_server_timeout: float = field(
+        default=240.0,
+        metadata={"help": "Seconds to wait for the vLLM server before raising ConnectionError."},
+    )
     vllm_device: Optional[str] = field(
         default="auto",
         metadata={
@@ -250,13 +303,15 @@ class DiffuGRPOConfig(TrainingArguments):
         },
     )
     vllm_gpu_memory_utilization: float = field(
-        default=0.9,
+        default=0.3,
         metadata={
-            "help": "Ratio (between 0 and 1) of GPU memory to reserve for the model weights, activations, and KV "
-            "cache on the device dedicated to generation powered by vLLM. Higher values will increase the KV cache "
-            "size and thus improve the model's throughput. However, if the value is too high, it may cause "
-            "out-of-memory (OOM) errors during initialization."
+            "help": "GPU memory utilization for vLLM when vllm_mode is colocate; for server mode, set on the server. "
+            "Higher values increase KV cache but risk OOM."
         },
+    )
+    vllm_tensor_parallel_size: int = field(
+        default=1,
+        metadata={"help": "Tensor parallel size for vLLM when vllm_mode is colocate."},
     )
     vllm_dtype: Optional[str] = field(
         default="auto",
@@ -310,12 +365,34 @@ class DiffuGRPOConfig(TrainingArguments):
         default=0.2,
         metadata={"help": "Epsilon value for clipping."},
     )
+    delta: Optional[float] = field(
+        default=None,
+        metadata={"help": "Optional upper bound for two-sided GRPO clipping (INTELLECT-2 style). None disables it."},
+    )
+    epsilon_high: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": "Upper epsilon for clipping; defaults to epsilon if None (e.g. DAPO recommends ~0.28)."
+        },
+    )
     reward_weights: Optional[list[float]] = field(
         default=None,
         metadata={
             "help": "Weights for each reward function. Must match the number of reward functions. If `None`, all "
             "rewards are weighted equally with weight `1.0`."
         },
+    )
+    scale_rewards: bool = field(
+        default=True,
+        metadata={"help": "Whether to scale rewards by their standard deviation (Dr. GRPO recommends False)."},
+    )
+    loss_type: str = field(
+        default="bnpo",
+        metadata={"help": "GRPO loss variant: grpo, bnpo, or dr_grpo."},
+    )
+    mask_truncated_completions: bool = field(
+        default=False,
+        metadata={"help": "Exclude truncated completions from the loss (DAPO-style stability)."},
     )
     sync_ref_model: bool = field(
         default=False,
@@ -339,11 +416,23 @@ class DiffuGRPOConfig(TrainingArguments):
             "synchronized with the reference policy. To use this parameter, you must set `sync_ref_model=True`."
         },
     )
+    use_liger_loss: bool = field(
+        default=False,
+        metadata={"help": "Whether to use the Liger fused GRPO loss."},
+    )
 
     # Parameters that control the logging
     log_completions: bool = field(
         default=False,
         metadata={"help": "Whether to log the completions during training."},
+    )
+    num_completions_to_print: Optional[int] = field(
+        default=None,
+        metadata={"help": "Number of completions to print with rich; None logs all."},
+    )
+    wandb_log_unique_prompts: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Whether to log only unique prompts to wandb."},
     )
 
     generation_batch_size: Optional[int] = field(
@@ -369,10 +458,6 @@ class DiffuGRPOConfig(TrainingArguments):
     dataset: Optional[str] = field(
         default="gsm8k",
     )
-    epsilon: float = field(
-        default=0.2,
-        metadata={"help": "Epsilon value for clipping."},
-    )
     p_mask_prompt: float = field(
         default=0.3,
         metadata={"help": "Probability of masking the prompt."},
@@ -385,3 +470,62 @@ class DiffuGRPOConfig(TrainingArguments):
         default=True,
         metadata={"help": "Whether to randomly mask tokens."},
     )
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        num_processes = self.world_size
+        if self.generation_batch_size is not None and self.steps_per_generation is not None:
+            raise ValueError(
+                "`generation_batch_size` and `steps_per_generation` cannot both be set; configure only one."
+            )
+
+        if self.steps_per_generation is None:
+            self.steps_per_generation = self.gradient_accumulation_steps
+
+        if self.generation_batch_size is None:
+            self.generation_batch_size = (
+                self.per_device_train_batch_size * num_processes * self.steps_per_generation
+            )
+
+        if self.generation_batch_size % (self.per_device_train_batch_size * num_processes) != 0:
+            raise ValueError(
+                f"generation_batch_size ({self.generation_batch_size}) must be divisible by the global batch size "
+                f"({self.per_device_train_batch_size * num_processes})."
+            )
+
+        self.steps_per_generation = self.generation_batch_size // (
+            self.per_device_train_batch_size * num_processes
+        )
+
+        if self.num_generations < 2:
+            raise ValueError(
+                "GRPO requires at least 2 generations per prompt. You provided "
+                f"{self.num_generations}, which is less than the minimum required."
+            )
+        possible_values = [
+            n_gen
+            for n_gen in range(2, self.generation_batch_size + 1)
+            if self.generation_batch_size % n_gen == 0
+        ]
+        if self.num_generations not in possible_values:
+            raise ValueError(
+                f"The effective train batch size ({num_processes} x {self.per_device_train_batch_size} x "
+                f"{self.steps_per_generation}) must be evenly divisible by the number of generations per "
+                f"prompt ({self.num_generations}). Given the current effective train batch size, valid values for "
+                f"num_generations are: {possible_values}."
+            )
+        if self.eval_strategy != "no":
+            global_eval_batch_size = self.per_device_eval_batch_size * num_processes
+            eval_possible = [
+                n_gen
+                for n_gen in range(2, global_eval_batch_size + 1)
+                if global_eval_batch_size % n_gen == 0
+            ]
+            if self.num_generations not in eval_possible:
+                raise ValueError(
+                    f"The global eval batch size ({num_processes} x {self.per_device_eval_batch_size}) must be "
+                    f"evenly divisible by num_generations ({self.num_generations}). Valid values: {eval_possible}."
+                )
+        if self.delta is not None and self.use_liger_loss:
+            raise ValueError("Liger loss does not support two-sided GRPO loss yet.")
