@@ -3,7 +3,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModel
 from termcolor import cprint
 import os
 from generation.fwd_counter import ForwardHookCounter
-from generation.generate import DLM_Generator
+from generation.generate import DLMGeneration
 
 def main(chat_history=False):
     
@@ -18,7 +18,7 @@ def main(chat_history=False):
     )
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     model.eval()
-    DLM = DLM_Generator(model)
+    DLM_Gen = DLMGeneration()
     forward_counter = ForwardHookCounter(model)
 
     # Initialize conversation history
@@ -52,7 +52,8 @@ def main(chat_history=False):
         tokens = {k: v.to(model.device) for k, v in tokens.items()}
 
         with forward_counter.count():
-            output_ids = DLM.block_decode_with_block_causal_attention(
+            output_ids = DLM_Gen.block_decode_with_block_causal_attention(
+                model=model,
                 input_ids=tokens['input_ids'],
                 attention_mask=tokens['attention_mask'],
                 temperature=0.0,
@@ -77,7 +78,8 @@ def main(chat_history=False):
         print('-'*100)
 
         with forward_counter.count():
-            output_ids, _ = DLM.block_decode_with_block_causal_attention_FreeDave(
+            output_ids, _ = DLM_Gen.block_decode_with_block_causal_attention_FreeDave(
+                model=model,
                 input_ids=tokens['input_ids'],
                 attention_mask=tokens['attention_mask'],
                 temperature=0.0,
@@ -106,7 +108,8 @@ def main(chat_history=False):
         print('-'*100)
 
         with forward_counter.count():
-            output_ids, _ = DLM.block_decode_with_block_causal_attention_FreeDave(
+            output_ids, _ = DLM_Gen.block_decode_with_block_causal_attention_FreeDave(
+                model=model,
                 input_ids=tokens['input_ids'],
                 attention_mask=tokens['attention_mask'],
                 temperature=0.0,

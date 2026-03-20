@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PreTrainedModel
 from transformers.generation.configuration_utils import GenerationConfig
@@ -19,16 +20,15 @@ logger = logging.get_logger(__name__)
 AR_ADAPTED_DLM = ['DreamModel', 'DreamBaseModel']
 
 
-class DLM_Generator:
+class DLMGeneration:
 
-    def __init__(self, model: PreTrainedModel, generation_config: Optional[GenerationConfig] = None):
-        self.model = model
-        self.generation_config = generation_config
-        self.device = model.device
+    def __init__(self):
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.token_per_step = 1
 
     def get_processed_model_outputs(
         self, 
+        model: nn.Module,
         x: torch.Tensor, 
         attention_mask: Optional[torch.LongTensor] = None, 
         position_ids: Optional[torch.LongTensor] = None,
@@ -43,13 +43,13 @@ class DLM_Generator:
             For AR-adapted DLM, we need to process the model logits due to the logits shift.
         '''
 
-        if self.model.__class__.__name__ in AR_ADAPTED_DLM:
-            model_output = self.model(
-                x, 
-                attention_mask, 
-                position_ids, 
-                past_key_values, 
-                use_cache=use_cache, 
+        if model.__class__.__name__ in AR_ADAPTED_DLM:
+            model_output = model(
+                input_ids=x,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
                 output_attentions=output_attentions,
                 dual_cache=dual_cache,
             )
@@ -60,14 +60,14 @@ class DLM_Generator:
             return logits, attentions
 
         else:
-            model_output = self.model(
-                x, 
-                attention_mask, 
-                position_ids, 
-                past_key_values, 
-                use_cache=use_cache, 
-                output_attentions=output_attentions, 
-                store_kv=store_kv
+            model_output = model(
+                input_ids=x,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                store_kv=store_kv,
             )
             logits = model_output.logits
             attentions = model_output.attentions if output_attentions and hasattr(model_output, 'attentions') else None
@@ -279,8 +279,9 @@ class DLM_Generator:
     @torch.no_grad()
     def block_decode_with_full_attention(
         self, 
+        model: nn.Module,
         input_ids: torch.Tensor,
-        attention_mask: Optional[torch.LongTensor],
+        attention_mask: Optional[torch.LongTensor] = None,
         temperature: float = 0.0,
         top_p: Optional[float] = None,
         top_k: Optional[int] = None,
@@ -289,12 +290,12 @@ class DLM_Generator:
         max_gen_length: Optional[int] = 128,
         decoding_steps: Optional[int] = 128,
         use_cache: bool = False,
+        dual_cache: bool = False,
         mask_token_id: int = 151666,
         eos_token_id: int = 151645,
         pad_token_id: int = 151643,
         pad_target_penalty: float = 1.0,
         confidence_threshold: Optional[float] = None,
-        dual_cache: bool = False
     ):
         '''
         NOTE: now only consider 1 token per step; all the token transfer operations are performed in the block region. 
@@ -337,7 +338,8 @@ class DLM_Generator:
                 past_key_values = DynamicCache()
             # update cache and get logits
             logits, _ = self.get_processed_model_outputs(
-                x,
+                model=model,
+                x=x,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
@@ -373,7 +375,8 @@ class DLM_Generator:
                 if dual_cache:
                     # use the current block for forward pass
                     logits, _ = self.get_processed_model_outputs(
-                        x[:, current_block_start:current_block_end], 
+                        model=model,
+                        x=x[:, current_block_start:current_block_end], 
                         attention_mask=current_attention_mask, 
                         position_ids=torch.arange(current_block_start, current_block_end, device=x.device).unsqueeze(0), 
                         past_key_values=past_key_values, 
@@ -382,7 +385,8 @@ class DLM_Generator:
                 else:
                     # use the entire remaining sequence for forward pass
                     logits, _ = self.get_processed_model_outputs(
-                        x[:, current_block_start:], 
+                        model=model,
+                        x=x[:, current_block_start:], 
                         attention_mask=current_attention_mask, 
                         position_ids=position_ids[:, current_block_start:] if position_ids is not None else None, 
                         past_key_values=past_key_values, 
@@ -420,8 +424,9 @@ class DLM_Generator:
     @torch.no_grad()
     def block_decode_with_full_attention_FreeDave(
         self, 
+        model: nn.Module,
         input_ids: torch.Tensor,
-        attention_mask: Optional[torch.LongTensor],
+        attention_mask: Optional[torch.LongTensor] = None,
         temperature: float = 0.0,
         top_p: Optional[float] = None,
         top_k: Optional[int] = None,
@@ -433,12 +438,12 @@ class DLM_Generator:
         eager_acceptance_mode: Optional[bool] = False,
         draft_mode: Optional[str] = 'tree_attention',
         use_cache: bool = False,
+        dual_cache: bool = False,
         mask_token_id: int = 151666,
         eos_token_id: int = 151645,
         pad_token_id: int = 151643,
         pad_target_penalty: float = 1.0,
         confidence_threshold: Optional[float] = None,
-        dual_cache: bool = False
     ):
         '''
         block_decode_with_full_attention_FreeDave for full-attention DLMs.
@@ -501,7 +506,8 @@ class DLM_Generator:
                 past_key_values = DynamicCache()
             # update cache and get logits
             logits, _ = self.get_processed_model_outputs(
-                x,
+                model=model,
+                x=x,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
@@ -579,15 +585,17 @@ class DLM_Generator:
                 if num_gen_blocks - block_idx == 1 and current_window_mask_index[:, :block_length].sum() <= self.token_per_step:
                     x[:, current_window_start:current_window_end] = current_window_x_draft[::current_window_draft_steps]
                     newly_unmasked = current_window_mask_index & (x[:, current_window_start:current_window_end] != mask_token_id)
-                    trajectory_step_map[:, current_window_start:current_window_end][newly_unmasked] = global_step
-                    global_step += 1
+                    if newly_unmasked.any():
+                        trajectory_step_map[:, current_window_start:current_window_end][newly_unmasked] = global_step
+                        global_step += 1
                     break
 
                 if not eager_acceptance_mode and current_window_mask_index[:, :block_length].sum() <= self.token_per_step:
                     x[:, current_window_start:current_window_end] = current_window_x_draft[::current_window_draft_steps]
                     newly_unmasked = current_window_mask_index & (x[:, current_window_start:current_window_end] != mask_token_id)
-                    trajectory_step_map[:, current_window_start:current_window_end][newly_unmasked] = global_step
-                    global_step += 1
+                    if newly_unmasked.any():
+                        trajectory_step_map[:, current_window_start:current_window_end][newly_unmasked] = global_step
+                        global_step += 1
                     break
                 
                 if dual_cache:
@@ -595,7 +603,8 @@ class DLM_Generator:
                     if draft_mode == 'batch_expanding':
                         past_key_values.batch_repeat_interleave(current_window_draft_steps)
                         logits, _ = self.get_processed_model_outputs(
-                            current_window_x_draft,
+                            model=model,
+                            x=current_window_x_draft,
                             attention_mask=None,
                             position_ids=torch.arange(current_window_start, current_window_end, device=x.device).unsqueeze(0).expand(batch_size * current_window_draft_steps, -1),
                             past_key_values=past_key_values,
@@ -622,7 +631,8 @@ class DLM_Generator:
                             num_branches=current_window_draft_steps
                         )
                         logits, _ = self.get_processed_model_outputs(
-                            current_window_x_draft.view(batch_size, -1),
+                            model=model,
+                            x=current_window_x_draft.view(batch_size, -1),
                             attention_mask=tree_attention_mask,
                             position_ids=tree_position_ids,
                             past_key_values=past_key_values,
@@ -643,7 +653,8 @@ class DLM_Generator:
                     if draft_mode == 'batch_expanding':
                         past_key_values.batch_repeat_interleave(current_window_draft_steps)
                         logits, _ = self.get_processed_model_outputs(
-                            torch.cat([current_window_x_draft, x[:, current_window_end:].expand(current_window_x_draft.shape[0], -1)], dim=-1),
+                            model=model,
+                            x=torch.cat([current_window_x_draft, x[:, current_window_end:].expand(current_window_x_draft.shape[0], -1)], dim=-1),
                             attention_mask=attention_mask,
                             position_ids=position_ids[:, current_block_start:] if position_ids is not None else None, 
                             past_key_values=past_key_values,
@@ -673,7 +684,8 @@ class DLM_Generator:
                         )
 
                         logits, _ = self.get_processed_model_outputs(
-                            torch.cat([current_window_x_draft, x[:, current_window_end:].expand(current_window_x_draft.shape[0], -1)], dim=-1).view(batch_size, -1),
+                            model=model,
+                            x=torch.cat([current_window_x_draft, x[:, current_window_end:].expand(current_window_x_draft.shape[0], -1)], dim=-1).view(batch_size, -1),
                             attention_mask=tree_attention_mask,
                             position_ids=tree_position_ids,
                             past_key_values=past_key_values,
@@ -715,6 +727,10 @@ class DLM_Generator:
 
                 if eager_acceptance_mode and (current_window_x_draft[:, matched_steps, :block_length] != mask_token_id).all():
                     x[:, current_window_start:current_window_end] = current_window_x_target[:, matched_steps, :]
+                    newly_unmasked = current_window_mask_index & (x[:, current_window_start:current_window_end] != mask_token_id)
+                    if newly_unmasked.any():
+                        trajectory_step_map[:, current_window_start:current_window_end][newly_unmasked] = global_step
+                        global_step += 1
                 else:
                     x[:, current_window_start:current_window_end] = current_window_x_draft[:, matched_steps, :]
                     newly_unmasked = current_window_mask_index & (x[:, current_window_start:current_window_end] != mask_token_id)
@@ -739,8 +755,9 @@ class DLM_Generator:
     @torch.no_grad()
     def block_decode_with_block_causal_attention(
         self, 
+        model: nn.Module,
         input_ids: torch.Tensor,
-        attention_mask: Optional[torch.LongTensor],
+        attention_mask: Optional[torch.LongTensor] = None,
         temperature: float = 0.0,
         top_p: Optional[float] = None,
         top_k: Optional[int] = None,
@@ -794,7 +811,8 @@ class DLM_Generator:
                 cur_attn_mask = cur_attn_mask[:, None, :, :]
             cur_position_ids = position_ids[:, :prefill_length]
             self.get_processed_model_outputs(
-                cur_x,
+                model=model,
+                x=cur_x,
                 attention_mask=cur_attn_mask,
                 position_ids=cur_position_ids,
                 past_key_values=past_key_values,
@@ -819,7 +837,8 @@ class DLM_Generator:
                 current_block_mask_index = (current_block_x == mask_token_id)
 
                 logits, _ = self.get_processed_model_outputs(
-                    current_block_x,
+                    model=model,
+                    x=current_block_x,
                     attention_mask=current_block_attention_mask,
                     position_ids=current_block_position_ids,
                     past_key_values=past_key_values,
@@ -849,9 +868,10 @@ class DLM_Generator:
                 if (current_block_x != mask_token_id).all():
                     # if the current block is all unmasked, store the current block's kv and exit the decoding loop
                     self.get_processed_model_outputs(
-                        current_block_x,
-                        current_block_attention_mask,
-                        current_block_position_ids,
+                        model=model,
+                        x=current_block_x,
+                        attention_mask=current_block_attention_mask,
+                        position_ids=current_block_position_ids,
                         past_key_values=past_key_values,
                         use_cache=True,
                         store_kv=True
@@ -866,8 +886,9 @@ class DLM_Generator:
     @torch.no_grad()
     def block_decode_with_block_causal_attention_FreeDave(
         self,
+        model: nn.Module,
         input_ids: torch.Tensor,
-        attention_mask: Optional[torch.LongTensor],
+        attention_mask: Optional[torch.LongTensor] = None,
         temperature: float = 0.0,
         top_p: Optional[float] = None,
         top_k: Optional[int] = None,
@@ -930,12 +951,13 @@ class DLM_Generator:
                 cur_attn_mask = cur_attn_mask[:, None, :, :]
             cur_position_ids = position_ids[:, :prefill_length]
             self.get_processed_model_outputs(
-                cur_x,
+                model=model,
+                x=cur_x,
                 attention_mask=cur_attn_mask,
                 position_ids=cur_position_ids,
                 past_key_values=past_key_values,
                 use_cache=True,
-                store_kv=True
+                store_kv=True,
             )
 
         # Decoding stage
@@ -972,9 +994,10 @@ class DLM_Generator:
             if current_window_mask_index[:, :block_length].sum() == 0:
                 # if the current block is all unmasked, store the current block's kv and proceed to the next block
                 self.get_processed_model_outputs(
-                    current_window_x[:, :block_length],
-                    current_window_attention_mask[..., :block_length, :current_window_start + block_length],
-                    current_window_position_ids[:, :block_length],
+                    model=model,
+                    x=current_window_x[:, :block_length],
+                    attention_mask=current_window_attention_mask[..., :block_length, :current_window_start + block_length],
+                    position_ids=current_window_position_ids[:, :block_length],
                     past_key_values=past_key_values,
                     use_cache=True,
                     store_kv=True
@@ -983,7 +1006,8 @@ class DLM_Generator:
 
             # first forward pass for the current block
             logits, _ = self.get_processed_model_outputs(
-                current_window_x,
+                model=model,
+                x=current_window_x,
                 attention_mask=current_window_attention_mask,
                 position_ids=current_window_position_ids,
                 past_key_values=past_key_values,
@@ -1024,23 +1048,26 @@ class DLM_Generator:
                     # Take every interval-th (current_block_draft_steps-th) sample in batch as per interval batch index
                     current_window_x = current_window_x_draft[::current_window_draft_steps]
                     newly_unmasked = current_window_mask_index & (current_window_x != mask_token_id)
-                    trajectory_step_map[:, current_window_start:current_window_end][newly_unmasked] = global_step
-                    global_step += 1
+                    if newly_unmasked.any():
+                        trajectory_step_map[:, current_window_start:current_window_end][newly_unmasked] = global_step
+                        global_step += 1
                     break
 
                 # if eager mode disabled and the last step in the current block, accept draft tokens and exit
                 if not eager_acceptance_mode and current_window_mask_index[:, :block_length].sum() <= self.token_per_step:
                     current_window_x = current_window_x_draft[::current_window_draft_steps]
                     newly_unmasked = current_window_mask_index & (current_window_x != mask_token_id)
-                    trajectory_step_map[:, current_window_start:current_window_end][newly_unmasked] = global_step
-                    global_step += 1
+                    if newly_unmasked.any():
+                        trajectory_step_map[:, current_window_start:current_window_end][newly_unmasked] = global_step
+                        global_step += 1
                     break
 
                 # batch forward the draft blocks
                 if draft_mode == 'batch_expanding':
                     past_key_values.batch_repeat_interleave(current_window_draft_steps)
                     logits, _ = self.get_processed_model_outputs(
-                        current_window_x_draft, # (batch_size * current_window_draft_steps, current_window_len)
+                        model=model,
+                        x=current_window_x_draft, # (batch_size * current_window_draft_steps, current_window_len)
                         attention_mask=current_window_attention_mask,
                         position_ids=current_window_position_ids,
                         past_key_values=past_key_values,
@@ -1070,7 +1097,8 @@ class DLM_Generator:
                     )
 
                     logits, _ = self.get_processed_model_outputs(
-                        current_window_x_draft.view(batch_size, -1), # (batch_size, current_window_len * current_window_draft_steps)
+                        model=model,
+                        x=current_window_x_draft.view(batch_size, -1), # (batch_size, current_window_len * current_window_draft_steps)
                         attention_mask=current_window_draft_blocks_tree_attention_mask,
                         position_ids=current_window_draft_blocks_tree_position_ids,
                         past_key_values=past_key_values,
@@ -1111,13 +1139,17 @@ class DLM_Generator:
                 # total_draft_steps += current_window_draft_steps
 
                 if eager_acceptance_mode and (current_window_x_draft[:, matched_steps, :block_length] != mask_token_id).all():
-                    # TODO: implement eager acceptance mode
                     current_window_x = current_window_x_target[:, matched_steps, :]
+                    newly_unmasked = current_window_mask_index & (current_window_x != mask_token_id)
+                    if newly_unmasked.any():
+                        trajectory_step_map[:, current_window_start:current_window_end][newly_unmasked] = global_step
+                        global_step += 1
                 else:
                     current_window_x = current_window_x_draft[:, matched_steps, :]
                     newly_unmasked = current_window_mask_index & (current_window_x != mask_token_id)
-                    trajectory_step_map[:, current_window_start:current_window_end][newly_unmasked] = global_step
-                    global_step += 1
+                    if newly_unmasked.any():
+                        trajectory_step_map[:, current_window_start:current_window_end][newly_unmasked] = global_step
+                        global_step += 1
                     current_window_x0 = current_window_x0_draft.view(batch_size, current_window_draft_steps, *current_window_x.shape[1:])[:, matched_steps, :]
                     current_window_confidence = current_window_confidence_draft.view(batch_size, current_window_draft_steps, *current_window_x.shape[1:])[:, matched_steps, :]
 
@@ -1129,9 +1161,10 @@ class DLM_Generator:
 
             # store the current block's kv
             self.get_processed_model_outputs(
-                current_window_x[:, :block_length],
-                current_window_attention_mask[..., :block_length, :current_window_start + block_length],
-                current_window_position_ids[:, :block_length],
+                model=model,
+                x=current_window_x[:, :block_length],
+                attention_mask=current_window_attention_mask[..., :block_length, :current_window_start + block_length],
+                position_ids=current_window_position_ids[:, :block_length],
                 past_key_values=past_key_values,
                 use_cache=True,
                 store_kv=True

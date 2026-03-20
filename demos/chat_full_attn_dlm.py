@@ -3,7 +3,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModel
 from termcolor import cprint
 import os
 from generation.fwd_counter import ForwardHookCounter
-from generation.generate import DLM_Generator
+from generation.generate import DLMGeneration
 
 def main(chat_history=False):
     
@@ -16,7 +16,7 @@ def main(chat_history=False):
     )
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     model.eval()
-    DLM = DLM_Generator(model)
+    DLM = DLMGeneration()
     forward_counter = ForwardHookCounter(model)
 
     # Initialize conversation history
@@ -51,6 +51,7 @@ def main(chat_history=False):
 
         with forward_counter.count():
             output_ids = DLM.block_decode_with_full_attention(
+                model=model,
                 input_ids=tokens['input_ids'],
                 attention_mask=tokens['attention_mask'],
                 temperature=0.0,
@@ -78,6 +79,7 @@ def main(chat_history=False):
 
         with forward_counter.count():
             output_ids, trajectory = DLM.block_decode_with_full_attention_FreeDave(
+                model=model,
                 input_ids=tokens['input_ids'],
                 attention_mask=tokens['attention_mask'],
                 temperature=0.0,
@@ -109,6 +111,7 @@ def main(chat_history=False):
 
         with forward_counter.count():
             output_ids, trajectory = DLM.block_decode_with_full_attention_FreeDave(
+                model=model,
                 input_ids=tokens['input_ids'],
                 attention_mask=tokens['attention_mask'],
                 temperature=0.0,
