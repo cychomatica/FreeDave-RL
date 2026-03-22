@@ -1,13 +1,14 @@
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModel
+from transformers import AutoTokenizer, AutoModel
 from termcolor import cprint
 import os
 from generation.fwd_counter import ForwardHookCounter
 from generation.generate import DLMGeneration
+import argparse
 
-def main(chat_history=False):
+def main(args):
     
-    model_name = 'Dream-org/Dream-v0-Instruct-7B'
+    model_name = args.model_name
     model = AutoModel.from_pretrained(
         model_name, 
         torch_dtype='float16', 
@@ -28,7 +29,7 @@ def main(chat_history=False):
     
     while True:
 
-        if not chat_history:
+        if not args.chat_history:
             messages = []
 
         prompt = input('Enter your question: \n')
@@ -50,7 +51,7 @@ def main(chat_history=False):
         tokens = {k: v.to(model.device) for k, v in tokens.items()}
 
         with forward_counter.count():
-            output_ids = DLM.block_decode_with_full_attention(
+            output_ids, trajectory = DLM.block_decode_with_full_attention(
                 model=model,
                 input_ids=tokens['input_ids'],
                 attention_mask=tokens['attention_mask'],
@@ -62,10 +63,11 @@ def main(chat_history=False):
                 max_gen_length=256,
                 decoding_steps=256,
                 use_cache=True,
-                dual_cache=True,
+                dual_cache=args.dual_cache,
                 mask_token_id=tokenizer.added_tokens_encoder[tokenizer.special_tokens_map['mask_token']],
                 eos_token_id=tokenizer.added_tokens_encoder[tokenizer.special_tokens_map['eos_token']],
                 pad_token_id=tokenizer.added_tokens_encoder[tokenizer.special_tokens_map['pad_token']],
+                confidence_threshold=args.confidence_threshold,
             )
         output_ids = output_ids.cpu()
         torch.cuda.empty_cache()
@@ -73,7 +75,7 @@ def main(chat_history=False):
         output_text = tokenizer.decode(output_ids[0][len(tokens['input_ids'][0]):], skip_special_tokens=False)
         cleaned_text = output_text.replace(tokenizer.special_tokens_map['mask_token'], '').replace(tokenizer.special_tokens_map['eos_token'], '').replace('<|im_end|>', '').strip()
 
-        cprint(f'Normal generation (dual cache): ({forward_counter})', 'yellow')
+        cprint(f'Normal generation ({"dual cache" if args.dual_cache else "prefix cache"}): ({forward_counter})', 'yellow')
         print('Model\'s Response:', cleaned_text)
         print('-'*100)
 
@@ -90,13 +92,14 @@ def main(chat_history=False):
                 max_gen_length=256,
                 decoding_steps=256,
                 use_cache=True,
-                dual_cache=True,
+                dual_cache=args.dual_cache,
                 eager_acceptance_mode=False,
-                draft_steps=4,
+                draft_steps=args.draft_steps,
                 draft_mode='batch_expanding',
                 mask_token_id=tokenizer.added_tokens_encoder[tokenizer.special_tokens_map['mask_token']],
                 eos_token_id=tokenizer.added_tokens_encoder[tokenizer.special_tokens_map['eos_token']],
                 pad_token_id=tokenizer.added_tokens_encoder[tokenizer.special_tokens_map['pad_token']],
+                confidence_threshold=None,
             )
         output_ids = output_ids.cpu()
         torch.cuda.empty_cache()
@@ -104,7 +107,7 @@ def main(chat_history=False):
         output_text = tokenizer.decode(output_ids[0][len(tokens['input_ids'][0]):], skip_special_tokens=False)
         cleaned_text = output_text.replace(tokenizer.special_tokens_map['mask_token'], '').replace(tokenizer.special_tokens_map['eos_token'], '').replace('<|im_end|>', '').strip()
 
-        cprint(f'FreeDave generation (dual cache, batch expanding): ({forward_counter})', 'yellow')
+        cprint(f'FreeDave generation ({"dual cache" if args.dual_cache else "prefix cache"}, batch expanding): ({forward_counter})', 'green')
         print('Model\'s Response:', cleaned_text)
         # print('Trajectory:', trajectory)
         print('-'*100)
@@ -122,13 +125,14 @@ def main(chat_history=False):
                 max_gen_length=256,
                 decoding_steps=256,
                 use_cache=True,
-                dual_cache=True,
+                dual_cache=args.dual_cache,
                 eager_acceptance_mode=False,
-                draft_steps=4,
+                draft_steps=args.draft_steps,
                 draft_mode='tree_attention',
                 mask_token_id=tokenizer.added_tokens_encoder[tokenizer.special_tokens_map['mask_token']],
                 eos_token_id=tokenizer.added_tokens_encoder[tokenizer.special_tokens_map['eos_token']],
                 pad_token_id=tokenizer.added_tokens_encoder[tokenizer.special_tokens_map['pad_token']],
+                confidence_threshold=None,
             )
         output_ids = output_ids.cpu()
         torch.cuda.empty_cache()
@@ -136,7 +140,7 @@ def main(chat_history=False):
         output_text = tokenizer.decode(output_ids[0][len(tokens['input_ids'][0]):], skip_special_tokens=False)
         cleaned_text = output_text.replace(tokenizer.special_tokens_map['mask_token'], '').replace(tokenizer.special_tokens_map['eos_token'], '').replace('<|im_end|>', '').strip()
 
-        cprint(f'FreeDave generation (dual cache, tree attention): ({forward_counter})', 'yellow')
+        cprint(f'FreeDave generation ({"dual cache" if args.dual_cache else "prefix cache"}, tree attention): ({forward_counter})', 'green')
         print('Model\'s Response:', cleaned_text)
         # print('Trajectory:', trajectory)
         print('-'*100)
@@ -145,4 +149,11 @@ def main(chat_history=False):
         messages.append({'role': 'assistant', 'content': cleaned_text})
 
 if __name__ == '__main__':
-    main(chat_history=True)
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--chat_history', type=bool, default=True)
+    parser.add_argument('--model_name', type=str, default='Dream-org/Dream-v0-Instruct-7B')
+    parser.add_argument('--confidence_threshold', type=float, default=0.9)
+    parser.add_argument('--draft_steps', type=int, default=4)
+    parser.add_argument('--dual_cache', action='store_true', default=False)
+    args = parser.parse_args()
+    main(args)

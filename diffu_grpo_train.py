@@ -74,23 +74,25 @@ def main(grpo_config, model_config):
     # Set up device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # 4 bit quantization configuration
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16,
-    )
+    # # 4 bit quantization configuration
+    # bnb_config = BitsAndBytesConfig(
+    #     load_in_4bit=True,
+    #     bnb_4bit_use_double_quant=True,
+    #     bnb_4bit_quant_type="nf4",
+    #     bnb_4bit_compute_dtype=torch.bfloat16,
+    # )
 
     # Load model and tokenizer
     model = AutoModel.from_pretrained(
         grpo_config.model_path,
         trust_remote_code=True,
         torch_dtype=torch.bfloat16,
-        quantization_config=bnb_config,
+        # quantization_config=bnb_config,
     ).to(device)
 
-    tokenizer = AutoTokenizer.from_pretrained(grpo_config.model_path, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        grpo_config.model_path, trust_remote_code=True, padding_side="left"
+    )
     tokenizer.pad_token = tokenizer.eos_token
     model.config.use_cache = False
 
@@ -109,6 +111,7 @@ def main(grpo_config, model_config):
         peft_config=peft_config,
         reward_funcs=reward_functions,
         train_dataset=train_set,
+        processing_class=tokenizer,
         mask_token_id=grpo_config.mask_id,
     )
 
@@ -118,7 +121,6 @@ def main(grpo_config, model_config):
         )
 
     trainer.train()
-
 
 if __name__ == "__main__":
     parser = TrlParser((DiffuGRPOConfig, ModelConfig))

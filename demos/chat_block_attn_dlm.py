@@ -4,13 +4,12 @@ from termcolor import cprint
 import os
 from generation.fwd_counter import ForwardHookCounter
 from generation.generate import DLMGeneration
+import argparse
 
-def main(chat_history=False):
+def main(args):
     
-    # model_name = 'Dream-org/Dream-v0-Instruct-7B'
-    model_name = 'Gen-Verse/TraDo-4B-Instruct'
+    model_name = args.model_name
     model = AutoModelForCausalLM.from_pretrained(
-    # model = AutoModel.from_pretrained(
         model_name, 
         torch_dtype='float16', 
         device_map='cuda',
@@ -30,7 +29,7 @@ def main(chat_history=False):
     
     while True:
 
-        if not chat_history:
+        if not args.chat_history:
             messages = []
 
         prompt = input('Enter your question: \n')
@@ -52,7 +51,7 @@ def main(chat_history=False):
         tokens = {k: v.to(model.device) for k, v in tokens.items()}
 
         with forward_counter.count():
-            output_ids = DLM_Gen.block_decode_with_block_causal_attention(
+            output_ids, trajectory = DLM_Gen.block_decode_with_block_attention(
                 model=model,
                 input_ids=tokens['input_ids'],
                 attention_mask=tokens['attention_mask'],
@@ -61,8 +60,8 @@ def main(chat_history=False):
                 top_k=None,
                 alg_temp=None,
                 block_length=4,
-                max_gen_length=128,
-                decoding_steps=128,
+                max_gen_length=256,
+                decoding_steps=256,
                 mask_token_id=tokenizer.added_tokens_encoder[tokenizer.special_tokens_map['mask_token']],
                 eos_token_id=tokenizer.added_tokens_encoder[tokenizer.special_tokens_map['eos_token']],
                 pad_token_id=tokenizer.added_tokens_encoder[tokenizer.special_tokens_map['pad_token']],
@@ -78,7 +77,7 @@ def main(chat_history=False):
         print('-'*100)
 
         with forward_counter.count():
-            output_ids, _ = DLM_Gen.block_decode_with_block_causal_attention_FreeDave(
+            output_ids, _ = DLM_Gen.block_decode_with_block_attention_FreeDave(
                 model=model,
                 input_ids=tokens['input_ids'],
                 attention_mask=tokens['attention_mask'],
@@ -88,8 +87,8 @@ def main(chat_history=False):
                 alg_temp=None,
                 block_length=4,
                 use_cache=True,
-                max_gen_length=128,
-                decoding_steps=128,
+                max_gen_length=256,
+                decoding_steps=256,
                 mask_token_id=tokenizer.added_tokens_encoder[tokenizer.special_tokens_map['mask_token']],
                 eos_token_id=tokenizer.added_tokens_encoder[tokenizer.special_tokens_map['eos_token']],
                 pad_token_id=tokenizer.added_tokens_encoder[tokenizer.special_tokens_map['pad_token']],
@@ -108,7 +107,7 @@ def main(chat_history=False):
         print('-'*100)
 
         with forward_counter.count():
-            output_ids, _ = DLM_Gen.block_decode_with_block_causal_attention_FreeDave(
+            output_ids, _ = DLM_Gen.block_decode_with_block_attention_FreeDave(
                 model=model,
                 input_ids=tokens['input_ids'],
                 attention_mask=tokens['attention_mask'],
@@ -118,8 +117,8 @@ def main(chat_history=False):
                 alg_temp=None,
                 block_length=4,
                 use_cache=True,
-                max_gen_length=128,
-                decoding_steps=128,
+                max_gen_length=256,
+                decoding_steps=256,
                 mask_token_id=tokenizer.added_tokens_encoder[tokenizer.special_tokens_map['mask_token']],
                 eos_token_id=tokenizer.added_tokens_encoder[tokenizer.special_tokens_map['eos_token']],
                 pad_token_id=tokenizer.added_tokens_encoder[tokenizer.special_tokens_map['pad_token']],
@@ -140,4 +139,8 @@ def main(chat_history=False):
         messages.append({'role': 'assistant', 'content': cleaned_text})
 
 if __name__ == '__main__':
-    main(chat_history=True)
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--chat_history', type=bool, default=True)
+    parser.add_argument('--model_name', type=str, default='Gen-Verse/TraDo-4B-Instruct')
+    args = parser.parse_args()
+    main(args)

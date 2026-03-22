@@ -1,3 +1,7 @@
 .claude
 .vscode
 __pycache__
+.wandb
+checkpoints
+.history
+eval/evals_results

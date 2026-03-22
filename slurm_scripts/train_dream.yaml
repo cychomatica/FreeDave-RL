@@ -3,7 +3,7 @@
 use_peft: true
 torch_dtype: bfloat16
 load_in_4bit: true
-model_path: LLaDA-sft-s1k-merged
+model_path: Dream-org/Dream-v0-Instruct-7B
 
 attn_implementation: flash_attention_2
 
@@ -52,19 +52,25 @@ run_name: gsm_sft_bs12
 output_dir: /checkpoints/gsm_sft_bs12  # <-- Replace with desired output directory
 
 # Parameters for saving checkpoints
-save_steps: 100
+save_steps: 50000
 save_strategy: steps
-save_total_limit: 500 
+save_total_limit: 500
+# Skip DeepSpeed ZeRO shards (global_step*/optim_states.pt, model_states.pt). Keeps ~adapter_model.safetensors + tokenizer + trainer_state.
+# You cannot resume optimizer/training state from these checkpoints—only reload the LoRA adapter.
+save_only_model: true
 
 # Diffusion and GRPO-specific
+# Dream <|mask|> must match tokenizer (default mask_id 126336 is Llada — wrong model → garbage / ultra-short completions).
+mask_id: 151666
 max_completion_length: 256
 max_prompt_length: 200
 block_length: 32
-diffusion_steps: 128
-generation_batch_size: 6
+diffusion_steps: 256
+generation_batch_size: 32
 remasking: low_confidence
 random_masking: True
 p_mask_prompt: 0.15
 beta: 0.04
 epsilon: 0.5
 num_iterations: 12
+temperature: 0.0

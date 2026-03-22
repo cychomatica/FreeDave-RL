@@ -15,9 +15,48 @@ from .cache_utils import DynamicDualCache
 
 logger = logging.get_logger(__name__)
 
+# NOTE: now supporting Dream, SDAR, and TraDo
+# LLaDA is not supported yet due to the necessity of customizing the modeling file.
 
 # TODO: support more AR-adapted DLM
 AR_ADAPTED_DLM = ['DreamModel', 'DreamBaseModel']
+
+
+def is_ar_adapted_dlm_model(model: nn.Module) -> bool:
+    """
+    True if the backbone is Dream-style and needs the AR-adapted logits shift in
+    `get_processed_model_outputs`. PEFT, DeepSpeed, and DDP wrap the real module;
+    a plain `model.__class__.__name__` check misses those and breaks generation.
+    """
+    seen: set[int] = set()
+    m: Optional[nn.Module] = model
+    for _ in range(16):
+        if m is None or id(m) in seen:
+            break
+        seen.add(id(m))
+        if m.__class__.__name__ in AR_ADAPTED_DLM:
+            return True
+        nxt: Optional[nn.Module] = None
+        if hasattr(m, "get_base_model"):
+            try:
+                nxt = m.get_base_model()
+            except Exception:
+                nxt = None
+        if nxt is not None and nxt is not m:
+            m = nxt
+            continue
+        if hasattr(m, "base_model") and hasattr(m.base_model, "model"):
+            inner = m.base_model.model
+            if inner is not m:
+                m = inner
+                continue
+        if hasattr(m, "module"):
+            inner = m.module
+            if inner is not m:
+                m = inner
+                continue
+        break
+    return False
 
 
 class DLMGeneration:
@@ -43,7 +82,7 @@ class DLMGeneration:
             For AR-adapted DLM, we need to process the model logits due to the logits shift.
         '''
 
-        if model.__class__.__name__ in AR_ADAPTED_DLM:
+        if is_ar_adapted_dlm_model(model):
             model_output = model(
                 input_ids=x,
                 attention_mask=attention_mask,
@@ -237,44 +276,56 @@ class DLMGeneration:
         mask_index = (x == mask_token_id)
 
         if confidence_threshold is not None:
-            # take all tokens with confidence >= confidence_threshold
-            # TODO: FreeDave v2: dynamic draft_steps based on confidence threshold, drafting all tokens with confidence >= confidence_threshold
-            # if (confidence >= confidence_threshold).sum() < draft_steps, still use draft_steps, otherwise use (confidence >= confidence_threshold).sum()
+            high_confidence_index = (confidence >= confidence_threshold)
             
-            pass
+            if draft_steps is None or draft_steps == 1:
+                # confidence-aware parallel decoding
+                transfer_index = torch.zeros_like(x, dtype=torch.bool)
+                for j in range(confidence.shape[0]):
+                    if high_confidence_index[j].any():
+                        transfer_index[j, high_confidence_index[j]] = True
+                    else:
+                        _, idx = torch.topk(confidence[j], min(token_per_step, mask_index[j].sum()))
+                        transfer_index[j, idx] = True
+                x[transfer_index] = x0[transfer_index]
+                return x
+            else:
+                # FreeDave v2: dynamic draft_steps based on confidence threshold, drafting all tokens with confidence >= confidence_threshold
+                # if num_high_confidence < draft_steps, still use draft_steps, otherwise use num_high_confidence
+                pass
+
     
+        if draft_steps is not None and draft_steps > 1:
+            x_draft = x.unsqueeze(1).expand(x.shape[0], draft_steps, *x.shape[1:]).clone() # (batch, draft_steps, seq_len)
         else:
-            if draft_steps is not None and draft_steps > 1:
-                x_draft = x.unsqueeze(1).expand(x.shape[0], draft_steps, *x.shape[1:]).clone() # (batch, draft_steps, seq_len)
-            else:
-                draft_steps = 1
-                x_draft = x.unsqueeze(1).clone() # (batch, 1, seq_len)
-            transfer_index = torch.zeros_like(x_draft, dtype=torch.bool)
+            draft_steps = 1
+            x_draft = x.unsqueeze(1).clone() # (batch, 1, seq_len)
+        transfer_index = torch.zeros_like(x_draft, dtype=torch.bool)
 
-            if confidence_priority_shift is not None:
-                confidence = confidence + confidence_priority_shift
+        if confidence_priority_shift is not None:
+            confidence = confidence + confidence_priority_shift
 
-            if alg_temp is None or alg_temp == 0: # maskgit: unmask tokens with highest confidence
-                for j in range(confidence.shape[0]):
-                    for k in range(draft_steps):
-                        _, idx = torch.topk(confidence[j], min(token_per_step * (k+1), mask_index[j].sum()))
-                        transfer_index[j, k, idx] = True
-            elif alg_temp == -1: # l2r: unmask left to right
-                for j in range(confidence.shape[0]):
-                    for k in range(draft_steps):
-                        idx = torch.arange(x.size(1), device=self.device)[mask_index[j]][:token_per_step * (k+1)]
-                        transfer_index[j, k, idx] = True
-            else:
-                raise NotImplementedError(f'Algorithm temperature {alg_temp} not supported yet. ')
+        if alg_temp is None or alg_temp == 0: # maskgit: unmask tokens with highest confidence
+            for j in range(confidence.shape[0]):
+                for k in range(draft_steps):
+                    _, idx = torch.topk(confidence[j], min(token_per_step * (k+1), mask_index[j].sum()))
+                    transfer_index[j, k, idx] = True
+        elif alg_temp == -1: # l2r: unmask left to right
+            for j in range(confidence.shape[0]):
+                for k in range(draft_steps):
+                    idx = torch.arange(x.size(1), device=self.device)[mask_index[j]][:token_per_step * (k+1)]
+                    transfer_index[j, k, idx] = True
+        else:
+            raise NotImplementedError(f'Algorithm temperature {alg_temp} not supported yet. ')
 
-            if draft_steps is not None and draft_steps > 1:
-                x_draft[transfer_index] = x0.unsqueeze(1).expand_as(x_draft)[transfer_index] # (batch, draft_steps, seq_len)
-                x_draft = x_draft.view(x.shape[0] * draft_steps, *x.shape[1:]) # (batch * draft_steps, seq_len)
-            else:
-                x_draft[transfer_index] = x0.unsqueeze(1)[transfer_index] # (batch, 1, seq_len)
-                x_draft = x_draft.squeeze(1) # (batch, seq_len)
+        if draft_steps is not None and draft_steps > 1:
+            x_draft[transfer_index] = x0.unsqueeze(1).expand_as(x_draft)[transfer_index] # (batch, draft_steps, seq_len)
+            x_draft = x_draft.view(x.shape[0] * draft_steps, *x.shape[1:]) # (batch * draft_steps, seq_len)
+        else:
+            x_draft[transfer_index] = x0.unsqueeze(1)[transfer_index] # (batch, 1, seq_len)
+            x_draft = x_draft.squeeze(1) # (batch, seq_len)
 
-            return x_draft
+        return x_draft
 
     @torch.no_grad()
     def block_decode_with_full_attention(
@@ -296,15 +347,24 @@ class DLMGeneration:
         pad_token_id: int = 151643,
         pad_target_penalty: float = 1.0,
         confidence_threshold: Optional[float] = None,
+        early_exit: Optional[bool] = False
     ):
         '''
-        NOTE: now only consider 1 token per step; all the token transfer operations are performed in the block region. 
+        NOTE: now only consider 1 token per step; all the token transfer operations are performed in the block region.
+
+        Returns:
+            x: ``[batch, prompt_length + max_gen_length]`` decoded ids.
+            generated_trajectory_step_map: ``[batch, max_gen_length]`` long tensor, step index at which each
+            completion position was first unmasked (``-1`` if still masked when the decode budget ends).
         '''
 
+        batch_size = input_ids.shape[0]
         prompt_length = input_ids.shape[1]
         max_length = prompt_length + max_gen_length
         x = F.pad(input_ids, (0, max_gen_length), value=mask_token_id)
-        
+        trajectory_step_map = torch.full((batch_size, max_length), -1, device=x.device, dtype=torch.long)
+        global_step = 0
+
         if block_length is None:
             block_length = max_gen_length
 
@@ -349,8 +409,9 @@ class DLMGeneration:
             # always unmask the first token in the current block due to the logits shift of AR-adapted DLM
             x0, confidence = sample_tokens(logits, temperature=temperature, top_k=top_k, top_p=top_p)
             x[:, current_block_start] = x0[:, current_block_start]
-                        
-            
+            trajectory_step_map[:, current_block_start] = global_step
+            global_step += 1
+
             if dual_cache:
                 # Compose [prefix, current-block, suffix] on-the-fly from base cache.
                 past_key_values.set_dual_layout(
@@ -413,13 +474,34 @@ class DLMGeneration:
                     token_per_step=self.token_per_step,
                     confidence_threshold=confidence_threshold
                 )
+                newly_unmasked = current_block_mask_index & (
+                    x[:, current_block_start:current_block_end] != mask_token_id
+                )
+                if newly_unmasked.any():
+                    trajectory_step_map[:, current_block_start:current_block_end][newly_unmasked] = global_step
+                    global_step += 1
 
                 step += 1
 
                 if (x[:, current_block_start:current_block_end] != mask_token_id).all():
                     break
-        
-        return x
+
+            if early_exit and (x[:, current_block_start:current_block_end] == eos_token_id).all():
+                if current_block_end < max_length:
+                    x[:, current_block_end:] = eos_token_id
+                    assert (trajectory_step_map[:, prompt_length:current_block_end] >= 0).all(), 'Undecoded positions found: {}.'.format((trajectory_step_map[:, prompt_length:current_block_end] < 0).nonzero())
+                break
+
+            if early_exit and (x[:, current_block_start:current_block_end] == pad_token_id).all():
+                if current_block_end < max_length:
+                    x[:, current_block_end:] = pad_token_id
+                    assert (trajectory_step_map[:, prompt_length:current_block_end] >= 0).all(), 'Undecoded positions found: {}.'.format((trajectory_step_map[:, prompt_length:current_block_end] < 0).nonzero())
+                break
+
+        generated_trajectory_step_map = trajectory_step_map[:, prompt_length:]
+        # assert (generated_trajectory_step_map >= 0).all(), 'Undecoded positions found: {}.'.format((generated_trajectory_step_map < 0).nonzero())
+
+        return x, generated_trajectory_step_map
 
     @torch.no_grad()
     def block_decode_with_full_attention_FreeDave(
@@ -444,6 +526,7 @@ class DLMGeneration:
         pad_token_id: int = 151643,
         pad_target_penalty: float = 1.0,
         confidence_threshold: Optional[float] = None,
+        early_exit: Optional[bool] = False,
     ):
         '''
         block_decode_with_full_attention_FreeDave for full-attention DLMs.
@@ -747,13 +830,25 @@ class DLMGeneration:
                 if (x[:, current_window_start:current_window_end] != mask_token_id).all():
                     break
 
-        generated_trajectory_step_map = trajectory_step_map[:, prompt_length:prompt_length + max_gen_length]
-        assert (generated_trajectory_step_map >= 0).all(), 'Undecoded positions found: {}.'.format((generated_trajectory_step_map < 0).nonzero())
+            if early_exit and (x[:, current_block_start:current_block_end] == eos_token_id).all():
+                if current_block_end < max_length:
+                    x[:, current_block_end:] = eos_token_id
+                    assert (trajectory_step_map[:, prompt_length:current_block_end] >= 0).all(), 'Undecoded positions found: {}.'.format((trajectory_step_map[:, prompt_length:current_block_end] < 0).nonzero())
+                break
+
+            if early_exit and (x[:, current_block_start:current_block_end] == pad_token_id).all():
+                if current_block_end < max_length:
+                    x[:, current_block_end:] = pad_token_id
+                    assert (trajectory_step_map[:, prompt_length:current_block_end] >= 0).all(), 'Undecoded positions found: {}.'.format((trajectory_step_map[:, prompt_length:current_block_end] < 0).nonzero())
+                break
+
+        generated_trajectory_step_map = trajectory_step_map[:, prompt_length:]
+        # assert (generated_trajectory_step_map >= 0).all(), 'Undecoded positions found: {}.'.format((generated_trajectory_step_map < 0).nonzero())
 
         return x, generated_trajectory_step_map
 
     @torch.no_grad()
-    def block_decode_with_block_causal_attention(
+    def block_decode_with_block_attention(
         self, 
         model: nn.Module,
         input_ids: torch.Tensor,
@@ -771,12 +866,19 @@ class DLMGeneration:
         pad_token_id: int = 151643,
         pad_target_penalty: float = 1.0,
         confidence_threshold: Optional[float] = None,
+        early_exit: Optional[bool] = False,
         *args,
         **kwargs
     ):
         '''
         block_decode_with_block_causal_attention for block-causal models like SDAR and TraDo
-        NOTE: now only consider 1 token per step; all the token transfer operations are performed in the block region. 
+        NOTE: now only consider 1 token per step; all the token transfer operations are performed in the block region.
+
+        Returns:
+            x: decoded ids (length padded to a multiple of ``block_length``).
+            generated_trajectory_step_map: ``[batch, max_gen_length]`` step index when each of the first
+            ``max_gen_length`` completion positions (after the original prompt) was first unmasked
+            (``-1`` if still masked when decoding stops).
         '''
 
         batch_size = input_ids.shape[0]
@@ -786,6 +888,9 @@ class DLMGeneration:
         num_total_blocks = (prompt_length + max_gen_length + block_length - 1) // block_length # pad the whole sequence to be divisible by block_length
         max_length = num_total_blocks * block_length
         x = F.pad(input_ids, (0, max_length - prompt_length), value=mask_token_id)
+
+        trajectory_step_map = torch.full((batch_size, max_length), -1, device=x.device, dtype=torch.long)
+        global_step = 0
 
         num_prefill_blocks = prompt_length // block_length
         prefill_length = num_prefill_blocks * block_length
@@ -863,7 +968,12 @@ class DLMGeneration:
                     mask_token_id=mask_token_id,
                     alg_temp=alg_temp,
                     token_per_step=self.token_per_step,
+                    confidence_threshold=confidence_threshold
                 )
+                newly_unmasked = current_block_mask_index & (current_block_x != mask_token_id)
+                if newly_unmasked.any():
+                    trajectory_step_map[:, current_block_start:current_block_end][newly_unmasked] = global_step
+                    global_step += 1
 
                 if (current_block_x != mask_token_id).all():
                     # if the current block is all unmasked, store the current block's kv and exit the decoding loop
@@ -880,11 +990,27 @@ class DLMGeneration:
 
             # commit the current block to the sequence
             x[:, current_block_start:current_block_end] = current_block_x
-        
-        return x
+
+            # early exit if the current block is all eos tokens or pad tokens
+            if early_exit and (x[:, current_block_start:current_block_end] == eos_token_id).all():
+                if current_block_end < max_length:
+                    x[:, current_block_end:] = eos_token_id
+                    assert (trajectory_step_map[:, prompt_length:current_block_end] >= 0).all(), 'Undecoded positions found: {}.'.format((trajectory_step_map[:, prompt_length:current_block_end] < 0).nonzero())
+                break
+
+            if early_exit and (x[:, current_block_start:current_block_end] == pad_token_id).all():
+                if current_block_end < max_length:
+                    x[:, current_block_end:] = pad_token_id
+                    assert (trajectory_step_map[:, prompt_length:current_block_end] >= 0).all(), 'Undecoded positions found: {}.'.format((trajectory_step_map[:, prompt_length:current_block_end] < 0).nonzero())
+                break
+
+        generated_trajectory_step_map = trajectory_step_map[:, prompt_length:]
+        # assert (generated_trajectory_step_map >= 0).all(), 'Undecoded positions found: {}.'.format((generated_trajectory_step_map < 0).nonzero())
+
+        return x, generated_trajectory_step_map
 
     @torch.no_grad()
-    def block_decode_with_block_causal_attention_FreeDave(
+    def block_decode_with_block_attention_FreeDave(
         self,
         model: nn.Module,
         input_ids: torch.Tensor,
@@ -905,6 +1031,7 @@ class DLMGeneration:
         pad_token_id: int = 151643,
         pad_target_penalty: float = 1.0,
         confidence_threshold: Optional[float] = None,
+        early_exit: Optional[bool] = False,
     ):
 
         '''
@@ -1172,7 +1299,20 @@ class DLMGeneration:
             # commit the current block and future blocks (if any) to the sequence
             x[:, current_window_start:current_window_end] = current_window_x
 
-        generated_trajectory_step_map = trajectory_step_map[:, prompt_length:prompt_length + max_gen_length]
-        assert (generated_trajectory_step_map >= 0).all(), 'Undecoded positions found: {}.'.format((generated_trajectory_step_map < 0).nonzero())
+            # early exit if the current block is all eos tokens or pad tokens
+            if early_exit and (x[:, current_block_start:current_block_end] == eos_token_id).all():
+                if current_block_end < max_length:
+                    x[:, current_block_end:] = eos_token_id
+                    assert (trajectory_step_map[:, prompt_length:current_block_end] >= 0).all(), 'Undecoded positions found: {}.'.format((trajectory_step_map[:, prompt_length:current_block_end] < 0).nonzero())
+                break
+
+            if early_exit and (x[:, current_block_start:current_block_end] == pad_token_id).all():
+                if current_block_end < max_length:
+                    x[:, current_block_end:] = pad_token_id
+                    assert (trajectory_step_map[:, prompt_length:current_block_end] >= 0).all(), 'Undecoded positions found: {}.'.format((trajectory_step_map[:, prompt_length:current_block_end] < 0).nonzero())
+                break
+
+        generated_trajectory_step_map = trajectory_step_map[:, prompt_length:]
+        # assert (generated_trajectory_step_map >= 0).all(), 'Undecoded positions found: {}.'.format((generated_trajectory_step_map < 0).nonzero())
 
         return x, generated_trajectory_step_map

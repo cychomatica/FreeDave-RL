@@ -24,13 +24,42 @@ from trl.trainer.utils import (
 import wandb
 import os
 
-from generation.generate import DLMGeneration
+from generation.generate import DLMGeneration, is_ar_adapted_dlm_model
+from termcolor import cprint
 
 if is_peft_available():
     from peft import PeftConfig, get_peft_model
 # What we call a reward function is a callable that takes a list of prompts and completions and returns a list of
 # rewards. When it's a string, it's a model ID, so it's loaded as a pretrained model.
 RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
+
+
+def _replace_undecodable_token_ids(
+    tokenizer: PreTrainedTokenizerBase, token_ids: torch.Tensor
+) -> torch.Tensor:
+    """
+    DreamTokenizer maps OOV / gap ids with decoder.get(i) -> None; decode() then crashes in
+    convert_tokens_to_string (join expects str tokens). Replace such ids before batch_decode.
+    """
+    if token_ids.numel() == 0:
+        return token_ids
+    convert = getattr(tokenizer, "_convert_id_to_token", None)
+    if convert is None:
+        return token_ids
+    unk = getattr(tokenizer, "unk_token_id", None)
+    if unk is None:
+        unk = getattr(tokenizer, "pad_token_id", None)
+    if unk is None:
+        unk = 0
+    out = token_ids.clone()
+    bad = torch.zeros_like(out, dtype=torch.bool)
+    for tid in torch.unique(out).tolist():
+        if convert(int(tid)) is None:
+            bad |= out == tid
+    if bad.any():
+        fill = torch.tensor(unk, device=out.device, dtype=out.dtype)
+        out = torch.where(bad, fill, out)
+    return out
 
 
 def _ensure_prepare_inputs_for_generation(model: PreTrainedModel) -> None:
@@ -104,6 +133,8 @@ class DiffuGRPOTrainer(GRPOTrainer):
             optimizers=optimizers,
             peft_config=peft_config,
         )
+
+        self.right_shift_logits = is_ar_adapted_dlm_model(self.model)
 
         self.dlm_generation = DLMGeneration()
 
@@ -282,6 +313,11 @@ class DiffuGRPOTrainer(GRPOTrainer):
         block_length=128,
         temperature=0.0
     ):
+        tok = self.processing_class
+        eos_id = getattr(tok, "eos_token_id", None)
+        pad_id = getattr(tok, "pad_token_id", None)
+        if pad_id is None:
+            pad_id = eos_id
         return self.dlm_generation.block_decode_with_full_attention_FreeDave(
                 model=model,
                 input_ids=prompt,
@@ -290,11 +326,14 @@ class DiffuGRPOTrainer(GRPOTrainer):
                 max_gen_length=gen_length,
                 decoding_steps=steps,
                 draft_steps=4,
-                eager_acceptance_mode=True,
+                # Match demos/chat_full_attn_dlm.py (eager+dual can diverge from verified decode).
+                eager_acceptance_mode=False,
                 draft_mode='tree_attention',
                 use_cache=True,
                 dual_cache=True,
                 mask_token_id=self.args.mask_id,
+                eos_token_id=eos_id if eos_id is not None else 151645,
+                pad_token_id=pad_id if pad_id is not None else 151643,
             )
 
     def forward_process(self, batch, prompt_index, mask_id, seed=None):
@@ -327,6 +366,7 @@ class DiffuGRPOTrainer(GRPOTrainer):
 
     # TODO: support more DLMs in addition to Llada
     def get_logits(self, model, batch, prompt_index, cfg_scale, mask_id):
+
         if cfg_scale > 0.0:
             assert len(prompt_index) == batch.shape[1]
             prompt_index = prompt_index.unsqueeze(0).repeat(batch.shape[0], 1)
@@ -334,12 +374,17 @@ class DiffuGRPOTrainer(GRPOTrainer):
             un_batch[prompt_index] = mask_id
             batch = torch.cat([batch, un_batch])
 
-        input = batch
-        logits = model(input).logits
+        # Dream (and similar) SDPA path expects attn_mask=None or a 4D additive mask; a 2D [B,L]
+        # pad mask triggers shape errors inside scaled_dot_product_attention.
+        logits = model(input_ids=batch).logits
 
         if cfg_scale > 0.0:
             logits, un_logits = torch.chunk(logits, 2, dim=0)
             logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
+
+        if self.right_shift_logits:
+            logits = torch.cat([logits[:, :1], logits[:, :-1]], dim=1)
+
         return logits
 
     # TODO: simplify this function, now only consider 1 token per step
@@ -401,7 +446,7 @@ class DiffuGRPOTrainer(GRPOTrainer):
 
         # Get model predictions for the combined batch
         logits = self.get_logits(
-            model, perturbed_seq, prompt_index, self.args.cfg_scale, self.args.mask_id
+            model, perturbed_seq, prompt_index, 0, self.args.mask_id
         )  # [num_iterations * batch_size, seq_len, vocab_size]
 
         # Calculate cross-entropy loss for completion tokens only
@@ -414,6 +459,17 @@ class DiffuGRPOTrainer(GRPOTrainer):
         flat_logits = completion_logits.reshape(-1, completion_logits.size(-1))
         flat_targets = completion_targets.reshape(-1)
         loss = F.cross_entropy(flat_logits, flat_targets, reduction="none")
+
+        if loss.isnan().any():
+            cprint(f"loss: {loss}", "red")
+            cprint(f"flat_logits: {flat_logits}", "red")
+            cprint(f"flat_targets: {flat_targets}", "red")
+            cprint(f"completion_logits: {completion_logits}", "red")
+            cprint(f"completion_targets: {completion_targets}", "red")
+            cprint(f"logits: {logits}", "red")
+            cprint(f"expanded_input: {expanded_input}", "red")
+            cprint(f"perturbed_seq: {perturbed_seq}", "red")
+            raise ValueError("Loss is NaN")
 
         # Convert to log probabilities and reshape
         completion_log_probs = -loss.view(num_iterations * batch_size, logits_to_keep)
@@ -459,7 +515,7 @@ class DiffuGRPOTrainer(GRPOTrainer):
 
         # Get model predictions for the combined batch
         logits = self.get_logits(
-            model, perturbed_seq, prompt_index, self.args.cfg_scale, self.args.mask_id
+            model, perturbed_seq, prompt_index, 0, self.args.mask_id
         )  # [num_iterations * batch_size, seq_len, vocab_size]
 
         # Calculate cross-entropy loss for completion tokens only
@@ -581,7 +637,6 @@ class DiffuGRPOTrainer(GRPOTrainer):
         block_length = self.args.block_length
         steps = self.args.diffusion_steps
         temperature = self.args.temperature or 0.0
-        cfg_scale = self.args.cfg_scale
 
         with unwrap_model_for_generation(self.model_wrapped, self.accelerator) as unwrapped_model:
             prompt_completion_ids_all = []
@@ -599,11 +654,13 @@ class DiffuGRPOTrainer(GRPOTrainer):
                     steps=steps,
                     gen_length=gen_length,
                     block_length=block_length,
-                    temperature=temperature,
-                    # cfg_scale=cfg_scale,
-                    # remasking=self.args.remasking,
-                    # mask_id=self.args.mask_id,
+                    temperature=temperature
                 )
+                # cprint(f"batch_prompt_ids: {batch_prompt_ids}", "red")
+                # cprint(f"batch_prompt_sequence: {self.processing_class.batch_decode(batch_prompt_ids, skip_special_tokens=True)}", "red")
+                # cprint(f"batch_prompt_completion_ids: {batch_prompt_completion_ids}", "blue")
+                # cprint(f"batch_prompt_completion_sequence: {self.processing_class.batch_decode(batch_prompt_completion_ids, skip_special_tokens=True)}", "blue")
+
                 # batch_prompt_completion_ids: [1, seq_len], batch_trajectory_step_map: [1, gen_length]
                 prompt_completion_ids_all.append(batch_prompt_completion_ids)
                 trajectory_step_maps_all.append(batch_trajectory_step_map)
@@ -626,10 +683,18 @@ class DiffuGRPOTrainer(GRPOTrainer):
         logits_to_keep = completion_ids.size(1)
 
         batch_size = completion_ids.size(0)
-        # Per-example sampling of trajectory step indices from [0, max_step)
-        max_steps = trajectory_step_map.max(dim=1).values + 1  # [batch_size]
-        rand_vals = torch.rand(self.num_iterations, batch_size, device=device)
-        trajectory_step_indices = (rand_vals * max_steps.unsqueeze(0).float()).long()  # [num_itr, batch_size]
+        # Sample steps that actually appear on the trajectory map (under completion_mask).
+        # Uniform [0, max_step) often misses every position → active_mask.sum()==0 → 0/0 loss → NaN weights.
+        trajectory_step_indices = torch.zeros(
+            self.num_iterations, batch_size, dtype=torch.long, device=device
+        )
+        for b in range(batch_size):
+            m = completion_mask[b].bool()
+            vals = trajectory_step_map[b, m]
+            candidates = vals.unique() if vals.numel() > 0 else torch.tensor([0], device=device)
+            k = candidates.numel()
+            pick = torch.randint(0, k, (self.num_iterations,), device=device)
+            trajectory_step_indices[:, b] = candidates[pick]
 
         # compute log probabilities for old policy and reference model
         all_old_per_token_logps = []
@@ -664,8 +729,9 @@ class DiffuGRPOTrainer(GRPOTrainer):
                     )
                     all_ref_per_token_logps = ref_per_token_logps
 
-        # decode the completions to text
-        completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
+        # decode for rewards/logging only; keep completion_ids unchanged for loss (matches trajectory logps)
+        completion_ids_for_decode = _replace_undecodable_token_ids(self.processing_class, completion_ids)
+        completions_text = self.processing_class.batch_decode(completion_ids_for_decode, skip_special_tokens=True)
         if is_conversational(inputs[0]):
             completions = []
             for prompt, completion in zip(prompts, completions_text):
