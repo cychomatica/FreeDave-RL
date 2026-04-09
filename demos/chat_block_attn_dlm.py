@@ -2,8 +2,8 @@ import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModel
 from termcolor import cprint
 import os
-from generation.fwd_counter import ForwardHookCounter
-from generation.generate import DLMGeneration
+from generation.monitor_utils import ForwardMonitor
+from generation.generation_core import DLMGeneration
 import argparse
 
 def main(args):
@@ -17,8 +17,8 @@ def main(args):
     )
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     model.eval()
-    DLM_Gen = DLMGeneration()
-    forward_counter = ForwardHookCounter(model)
+    DLM_Gen = DLMGeneration(sdpa_additive_attention_mask=args.sdpa_additive_attention_mask)
+    inference_monitor = ForwardMonitor(model)
 
     # Initialize conversation history
     messages = []
@@ -50,8 +50,8 @@ def main(args):
         )
         tokens = {k: v.to(model.device) for k, v in tokens.items()}
 
-        with forward_counter.count():
-            output_ids, trajectory = DLM_Gen.block_decode_with_block_attention(
+        with inference_monitor.count():
+            output = DLM_Gen.block_decode_with_block_attention(
                 model=model,
                 input_ids=tokens['input_ids'],
                 attention_mask=tokens['attention_mask'],
@@ -59,25 +59,25 @@ def main(args):
                 top_p=None,
                 top_k=None,
                 alg_temp=None,
-                block_length=4,
-                max_gen_length=256,
-                decoding_steps=256,
+                block_length=args.block_length,
+                max_gen_length=args.max_gen_length,
+                decoding_steps=args.max_gen_length,
                 mask_token_id=tokenizer.added_tokens_encoder[tokenizer.special_tokens_map['mask_token']],
                 eos_token_id=tokenizer.added_tokens_encoder[tokenizer.special_tokens_map['eos_token']],
                 pad_token_id=tokenizer.added_tokens_encoder[tokenizer.special_tokens_map['pad_token']],
             )
-        output_ids = output_ids.cpu()
+        output_ids = output.sequences.cpu()
         torch.cuda.empty_cache()
 
         output_text = tokenizer.decode(output_ids[0][len(tokens['input_ids'][0]):], skip_special_tokens=False)
         cleaned_text = output_text.replace(tokenizer.special_tokens_map['mask_token'], '').replace(tokenizer.special_tokens_map['eos_token'], '').replace('<|im_end|>', '').strip()
 
-        cprint(f'Normal generation: ({forward_counter})', 'yellow')
-        print('Model\'s Response:', cleaned_text)
+        cprint('Normal generation: ({})'.format(inference_monitor), 'yellow')
+        print('Model\'s Response:\n', cleaned_text)
         print('-'*100)
 
-        with forward_counter.count():
-            output_ids, _ = DLM_Gen.block_decode_with_block_attention_FreeDave(
+        with inference_monitor.count():
+            output = DLM_Gen.block_decode_with_block_attention_FreeDave(
                 model=model,
                 input_ids=tokens['input_ids'],
                 attention_mask=tokens['attention_mask'],
@@ -85,55 +85,32 @@ def main(args):
                 top_p=None,
                 top_k=None,
                 alg_temp=None,
-                block_length=4,
+                block_length=args.block_length,
                 use_cache=True,
-                max_gen_length=256,
-                decoding_steps=256,
+                max_gen_length=args.max_gen_length,
+                decoding_steps=args.max_gen_length,
                 mask_token_id=tokenizer.added_tokens_encoder[tokenizer.special_tokens_map['mask_token']],
                 eos_token_id=tokenizer.added_tokens_encoder[tokenizer.special_tokens_map['eos_token']],
                 pad_token_id=tokenizer.added_tokens_encoder[tokenizer.special_tokens_map['pad_token']],
-                eager_acceptance_mode=True,
-                draft_steps=8,
-                draft_mode='batch_expanding',
+                eager_acceptance_mode=args.eager_acceptance_mode,
+                draft_steps=args.draft_steps,
+                draft_mode=args.draft_mode,
             )
-        output_ids = output_ids.cpu()
+        output_ids = output.sequences.cpu()
         torch.cuda.empty_cache()
 
         output_text = tokenizer.decode(output_ids[0][len(tokens['input_ids'][0]):], skip_special_tokens=False)
         cleaned_text = output_text.replace(tokenizer.special_tokens_map['mask_token'], '').replace(tokenizer.special_tokens_map['eos_token'], '').replace('<|im_end|>', '').strip()
 
-        cprint(f'FreeDave generation (batch expanding): ({forward_counter})', 'green')
-        print('Model\'s Response:', cleaned_text)
-        print('-'*100)
-
-        with forward_counter.count():
-            output_ids, _ = DLM_Gen.block_decode_with_block_attention_FreeDave(
-                model=model,
-                input_ids=tokens['input_ids'],
-                attention_mask=tokens['attention_mask'],
-                temperature=0.0,
-                top_p=None,
-                top_k=None,
-                alg_temp=None,
-                block_length=4,
-                use_cache=True,
-                max_gen_length=256,
-                decoding_steps=256,
-                mask_token_id=tokenizer.added_tokens_encoder[tokenizer.special_tokens_map['mask_token']],
-                eos_token_id=tokenizer.added_tokens_encoder[tokenizer.special_tokens_map['eos_token']],
-                pad_token_id=tokenizer.added_tokens_encoder[tokenizer.special_tokens_map['pad_token']],
-                eager_acceptance_mode=True,
-                draft_steps=8,
-                draft_mode='tree_attention',
-            )
-        output_ids = output_ids.cpu()
-        torch.cuda.empty_cache()
-
-        output_text = tokenizer.decode(output_ids[0][len(tokens['input_ids'][0]):], skip_special_tokens=False)
-        cleaned_text = output_text.replace(tokenizer.special_tokens_map['mask_token'], '').replace(tokenizer.special_tokens_map['eos_token'], '').replace('<|im_end|>', '').strip()
-
-        cprint(f'FreeDave generation (tree attention): ({forward_counter})', 'green')
-        print('Model\'s Response:', cleaned_text)
+        cprint(
+            'FreeDave generation ({}, eager_acceptance={}): ({})'.format(
+                args.draft_mode, 
+                args.eager_acceptance_mode, 
+                inference_monitor),
+            'green',
+        )
+        print('Model\'s Response:\n', cleaned_text)
+        # print('Trajectory step map: {}'.format(output.trajectory_step_map))
         print('-'*100)
         # Add the response from normal generation to the conversation history by default
         messages.append({'role': 'assistant', 'content': cleaned_text})
@@ -142,5 +119,11 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--chat_history', type=bool, default=True)
     parser.add_argument('--model_name', type=str, default='Gen-Verse/TraDo-4B-Instruct')
+    parser.add_argument('--block_length', type=int, default=4)
+    parser.add_argument('--max_gen_length', type=int, default=256)
+    parser.add_argument('--eager_acceptance_mode', action='store_true', default=False)
+    parser.add_argument('--draft_steps', type=int, default=8)
+    parser.add_argument('--draft_mode', type=str, default='tree_attention')
+    parser.add_argument('--sdpa_additive_attention_mask', action='store_true', default=False)
     args = parser.parse_args()
     main(args)

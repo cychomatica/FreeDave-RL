@@ -3,15 +3,14 @@
 use_peft: true
 torch_dtype: bfloat16
 load_in_4bit: true
-model_path: Dream-org/Dream-v0-Instruct-7B
+model_path: Gen-Verse/TraDo-4B-Instruct
 
 attn_implementation: flash_attention_2
-sdpa_additive_attention_mask: true
-mask_id: 151666
+sdpa_additive_attention_mask: false
+mask_id: 151669
 eos_id: 151643
 pad_id: 151643
-use_cache: false
-dual_cache: false
+use_cache: true
 
 lora_r: 128
 lora_alpha: 64
@@ -44,7 +43,7 @@ num_generations: 6
 num_train_epochs: 10
 
 per_device_eval_batch_size: 1
-per_device_train_batch_size: 6
+per_device_train_batch_size: 3
 gradient_accumulation_steps: 2
 
 

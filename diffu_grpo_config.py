@@ -179,7 +179,24 @@ class DiffuGRPOConfig(TrainingArguments):
     model_path: Optional[str] = field(
         default="",
     )
-
+    sdpa_additive_attention_mask: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to use SDPA additive attention mask. If True, the attention mask will be converted to SDPA additive form before each model forward."
+        },
+    )
+    use_cache: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to use cache for generation. If True, the cache will be used for generation."
+        },
+    )
+    dual_cache: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to use dual cache for generation. If True, the dual cache will be used for generation."
+        },
+    )
     num_generations: Optional[int] = field(
         default=8,
         metadata={
@@ -465,6 +482,14 @@ class DiffuGRPOConfig(TrainingArguments):
     mask_id: int = field(
         default=126336,
         metadata={"help": "Mask token id. Default is from Llada"},
+    )
+    eos_id: int = field(
+        default=126081,
+        metadata={"help": "EOS token id."},
+    )
+    pad_id: int = field(
+        default=126081,
+        metadata={"help": "Pad token id."},
     )
     random_masking: bool = field(
         default=True,

@@ -24,7 +24,7 @@ from trl.trainer.utils import (
 import wandb
 import os
 
-from generation.generate import DLMGeneration, is_ar_adapted_dlm_model
+from generation.generation_core import DLMGeneration, is_ar_adapted_dlm_model
 from termcolor import cprint
 
 if is_peft_available():
@@ -136,7 +136,7 @@ class DiffuGRPOTrainer(GRPOTrainer):
 
         self.right_shift_logits = is_ar_adapted_dlm_model(self.model)
 
-        self.dlm_generation = DLMGeneration()
+        self.dlm_generation = DLMGeneration(sdpa_additive_attention_mask=self.args.sdpa_additive_attention_mask)
 
     @profiling_decorator
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
@@ -313,12 +313,12 @@ class DiffuGRPOTrainer(GRPOTrainer):
         block_length=128,
         temperature=0.0
     ):
-        tok = self.processing_class
-        eos_id = getattr(tok, "eos_token_id", None)
-        pad_id = getattr(tok, "pad_token_id", None)
-        if pad_id is None:
-            pad_id = eos_id
-        return self.dlm_generation.block_decode_with_full_attention_FreeDave(
+        '''
+            now supports only full-attention DLMs like Dream and LLaDA.
+            block-attention DLMs like SDAR and TraDo use block attention instead of full attention. working on it.
+        '''
+        if "TraDo" in self.args.model_path:
+            outputs = self.dlm_generation.block_decode_with_block_attention_FreeDave(
                 model=model,
                 input_ids=prompt,
                 temperature=temperature,
@@ -326,15 +326,31 @@ class DiffuGRPOTrainer(GRPOTrainer):
                 max_gen_length=gen_length,
                 decoding_steps=steps,
                 draft_steps=4,
-                # Match demos/chat_full_attn_dlm.py (eager+dual can diverge from verified decode).
                 eager_acceptance_mode=False,
                 draft_mode='tree_attention',
-                use_cache=True,
-                dual_cache=True,
+                use_cache=self.args.use_cache,
                 mask_token_id=self.args.mask_id,
-                eos_token_id=eos_id if eos_id is not None else 151645,
-                pad_token_id=pad_id if pad_id is not None else 151643,
+                eos_token_id=self.args.eos_id,
+                pad_token_id=self.args.pad_id,
             )
+        else:
+            outputs = self.dlm_generation.block_decode_with_full_attention_FreeDave(
+                model=model,
+                input_ids=prompt,
+                temperature=temperature,
+                block_length=block_length,
+                max_gen_length=gen_length,
+                decoding_steps=steps,
+                draft_steps=4,
+                eager_acceptance_mode=False,
+                draft_mode='tree_attention',
+                use_cache=self.args.use_cache,
+                dual_cache=self.args.dual_cache,
+                mask_token_id=self.args.mask_id,
+                eos_token_id=self.args.eos_id,
+                pad_token_id=self.args.pad_id,
+            )
+        return outputs.sequences, outputs.trajectory_step_map
 
     def forward_process(self, batch, prompt_index, mask_id, seed=None):
         set_seed(seed)

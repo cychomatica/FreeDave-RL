@@ -1,6 +1,8 @@
+import os
+
 import torch
 import wandb
-from transformers import AutoTokenizer, AutoModel, BitsAndBytesConfig
+from transformers import AutoTokenizer, AutoModel, BitsAndBytesConfig, AutoModelForCausalLM
 from trl import TrlParser, ModelConfig
 from peft import LoraConfig
 import warnings
@@ -71,8 +73,16 @@ def main(grpo_config, model_config):
     else:
         train_set = dataset
 
-    # Set up device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Each distributed rank must use its own GPU; bare ``cuda`` is always cuda:0.
+    local_rank = int(os.environ.get("LOCAL_RANK", "-1"))
+    if torch.cuda.is_available():
+        if local_rank >= 0:
+            torch.cuda.set_device(local_rank)
+            device = torch.device("cuda", local_rank)
+        else:
+            device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
 
     # # 4 bit quantization configuration
     # bnb_config = BitsAndBytesConfig(
@@ -83,12 +93,19 @@ def main(grpo_config, model_config):
     # )
 
     # Load model and tokenizer
-    model = AutoModel.from_pretrained(
-        grpo_config.model_path,
-        trust_remote_code=True,
-        torch_dtype=torch.bfloat16,
-        # quantization_config=bnb_config,
-    ).to(device)
+    if "TraDo" in grpo_config.model_path:
+        model = AutoModelForCausalLM.from_pretrained(
+            grpo_config.model_path,
+            trust_remote_code=True,
+            torch_dtype=torch.bfloat16,
+        ).to(device)
+    else:
+        model = AutoModel.from_pretrained(
+            grpo_config.model_path,
+            trust_remote_code=True,
+            torch_dtype=torch.bfloat16,
+            # quantization_config=bnb_config,
+        ).to(device)
 
     tokenizer = AutoTokenizer.from_pretrained(
         grpo_config.model_path, trust_remote_code=True, padding_side="left"
