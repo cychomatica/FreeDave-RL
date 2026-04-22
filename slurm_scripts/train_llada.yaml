@@ -3,13 +3,13 @@
 use_peft: true
 torch_dtype: bfloat16
 load_in_4bit: true
-model_path: Dream-org/Dream-v0-Instruct-7B
+model_path: LLaDA-sft-s1k-merged
 
 attn_implementation: flash_attention_2
 sdpa_additive_attention_mask: true
-mask_id: 151666
-eos_id: 151643
-pad_id: 151643
+mask_id: 126336
+eos_id: 126081
+pad_id: 126081
 use_cache: false
 dual_cache: false
 
@@ -58,7 +58,7 @@ run_name: gsm_sft_bs12
 output_dir: /checkpoints/gsm_sft_bs12  # <-- Replace with desired output directory
 
 # Parameters for saving checkpoints
-save_steps: 50000
+save_steps: 10000
 save_strategy: steps
 save_total_limit: 500
 # Skip DeepSpeed ZeRO shards (global_step*/optim_states.pt, model_states.pt). Keeps ~adapter_model.safetensors + tokenizer + trainer_state.
@@ -69,7 +69,7 @@ save_only_model: true
 max_completion_length: 256
 max_prompt_length: 200
 block_length: 32
-diffusion_steps: 256
+diffusion_steps: 128
 generation_batch_size: 6
 remasking: low_confidence
 random_masking: True
@@ -77,4 +77,3 @@ p_mask_prompt: 0.15
 beta: 0.04
 epsilon: 0.5
 num_iterations: 12
-temperature: 0.0
