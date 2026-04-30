@@ -27,7 +27,10 @@ module load frameworks/2025.2.0 2>/dev/null || true
 [ -n "$AURORA_VENV" ] && source "$AURORA_VENV/bin/activate"
 
 # Install ezpz on first run (idempotent; harmless if already installed)
-python -c "import ezpz" 2>/dev/null || pip install --user 'ezpz @ git+https://github.com/saforem2/ezpz'
+# Use `python -m pip` (bare `pip` shebang in Aurora ClearML agent venv is broken).
+# DO NOT pass --no-build-isolation: ezpz needs hatchling, which isn't installed
+# globally; let pip create an isolated build env that fetches hatchling.
+python -c "import ezpz" 2>/dev/null || python -m pip install --user 'ezpz @ git+https://github.com/saforem2/ezpz'
 
 # libmpi.so.12 visibility (so CCL uses MPI transport, not silent OFI fallback)
 LIBMPI_DIR=""

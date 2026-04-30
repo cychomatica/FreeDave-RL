@@ -56,7 +56,7 @@ module use /soft/modulefiles 2>/dev/null || true
 module load frameworks/2025.2.0 2>/dev/null || true
 [ -n "$AURORA_VENV" ] && source "$AURORA_VENV/bin/activate"
 
-python -c "import ezpz" 2>/dev/null || pip install --user 'ezpz @ git+https://github.com/saforem2/ezpz'
+python -c "import ezpz" 2>/dev/null || python -m pip install --user 'ezpz @ git+https://github.com/saforem2/ezpz'
 
 LIBMPI_DIR=""
 for d in "$I_MPI_ROOT/lib/release" "$I_MPI_ROOT/lib" \

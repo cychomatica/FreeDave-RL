@@ -16,10 +16,18 @@ the user code runs — no per-rank wrapper needed.
 
 ## Status
 
-Same as the non-ezpz variant — see `../aurora/README.md` and
-`../aurora/ISSUES.md`. Single-node up to 6 tiles works; multi-node
-blocked on the same Aurora libfabric Cassini bug regardless of
-launcher choice.
+Single-node 2 tiles trains end-to-end (max_steps=2 reached, real loss
+values logged), **but** ezpz.setup_torch() on Aurora returns
+`world_size=1` per rank — each rank thinks it is the sole rank and runs
+standalone training (loads full 4.41B model, no XCCL gradient sync).
+True multi-rank distributed via this path is not validated yet.
+
+For a validated multi-tile distributed run, use the non-ezpz variant
+(`../aurora/`) which uses `mpiexec` + a per-rank wrapper + explicit
+`mpi4py.MPI` import; that recipe trains on up to 6 tiles end-to-end.
+
+Multi-node still hits the Aurora libfabric Cassini bug independent of
+launcher choice — see `../aurora/ISSUES.md`.
 
 ## Files
 
@@ -53,8 +61,8 @@ already importable.
 
 | Concern | mpiexec + launch_per_rank.sh | ezpz |
 |---|---|---|
-| RANK / WORLD_SIZE detection | Manual: read `PALS_RANKID`, `GLOBAL_WORLD_SIZE`, `PALS_LOCAL_RANKID` in a wrapper | Auto: ezpz detects PALS / Slurm / mpiexec |
-| MPI init | Manual: import `mpi4py.MPI` first in user code | Auto: `ezpz launch` calls `setup_torch_distributed` before user code |
+| RANK / WORLD_SIZE detection | Manual: read `PALS_RANKID`, `GLOBAL_WORLD_SIZE`, `PALS_LOCAL_RANKID` in a wrapper | `ezpz.setup_torch()` in user code (Aurora: see status caveat) |
+| MPI init | Manual: import `mpi4py.MPI` first in user code | `ezpz.setup_torch()` handles it |
 | MASTER_ADDR | Manual: `head -n 1 $PBS_NODEFILE` in parent shell | Auto |
 | Per-rank wrapper script | Required (`launch_per_rank.sh`) | Not needed |
 | Cross-system portability | Aurora-specific PALS env vars | Same script works on Polaris / Frontier / Perlmutter / local |
@@ -62,3 +70,28 @@ already importable.
 The Aurora oneCCL env recipe (CCL_*, FI_*, libmpi.so.12 visibility)
 remains the same — ezpz doesn't replace those, just the
 launcher-and-rank-detection layer.
+
+## Recipe (v7, 2026-04-30)
+
+User script needs only:
+
+```python
+import ezpz
+ezpz.setup_torch()           # MPI init + torch.distributed (XCCL on XPU)
+device = ezpz.get_torch_device()
+```
+
+(The full `aurora_patch.py` wraps this plus the unrelated XPU-compat
+shims for transformers / flash_attn / peft / torch.cuda aliases.)
+
+Install ezpz once into the venv (NOT `--user`, NOT
+`--no-build-isolation`):
+
+```bash
+python -m pip install 'ezpz @ git+https://github.com/saforem2/ezpz'
+```
+
+(Use `python -m pip` because the Aurora ClearML agent venv has a broken
+`pip` shebang; `--user` is rejected because `dill` is already in the
+venv's site-packages; `--no-build-isolation` fails because `hatchling`
+is not pre-installed.)
