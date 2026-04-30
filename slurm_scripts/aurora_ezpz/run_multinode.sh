@@ -1,18 +1,42 @@
 #!/bin/bash -l
 # ====================================================================
-# Multi-node TraDo-4B GRPO on Aurora using ezpz launcher
+# WORKING multi-node TraDo-4B GRPO on Aurora (validated 2-node x 2-tile)
 #
-# Same as the slurm_scripts/aurora/ multinode recipe, but with `ezpz
-# launch` replacing the manual mpiexec + launch_per_rank.sh + per-rank
-# env-var marshalling.  Submit via PBS on the debug or gpu_hack queue.
+# This is the v8g recipe that finally trains end-to-end across nodes
+# on Aurora gpu_hack.  Key fixes (vs the original ezpz launch path):
 #
-# STATUS: same Aurora libfabric Cassini bug as the non-ezpz variant.
-# See ../aurora/ISSUES.md for full bug record.
+#   1. Use direct mpiexec (NOT `ezpz launch`).  ezpz works on a single
+#      node but on Aurora gpu_hack its MPI_Init goes through PMIx and
+#      hits PMIX_ERR_UNREACH cross-node.  We still use ezpz.setup_torch()
+#      from user code for the Python-side torch.distributed bootstrap.
+#
+#   2. CCL_ATL_TRANSPORT=ofi (not mpi).  The MPI ATL path triggers the
+#      Aurora libfabric "cxil_map: write error" bug at the first
+#      cross-node oneCCL allgather.  OFI ATL bypasses it.
+#
+#   3. CCL_KVS_MODE=pmi (not mpi).  Required by oneCCL when ATL=ofi.
+#
+#   4. CXI provider workarounds:
+#      - FI_CXI_DISABLE_HOST_REGISTER=1
+#      - FI_CXI_OPTIMIZED_MRS=0
+#      - FI_MR_CACHE_MAX_COUNT=0
+#      These together make the Cassini provider stop trying the code
+#      path that produces cxil_map errors.
+#
+#   5. report_to=["wandb"] in the train YAML.  Inside a ClearML agent
+#      venv, HF Trainer auto-detects clearml and tries Task.init() with
+#      no creds in the user code -> MissingConfigError.  Limit
+#      report_to to wandb (or tensorboard) to skip that callback.
+#
+# Validated on Aurora 2026-04-30: 2 nodes x 2 tiles = 4 ranks,
+# DeepSpeed ZeRO-3, max_steps=2 reached with real loss values.
+#
+# See ../aurora/ISSUES.md for the historical cxil_map debugging trail.
 # ====================================================================
 #PBS -l select=2
 #PBS -l walltime=01:00:00
 #PBS -l filesystems=home:flare
-#PBS -q debug
+#PBS -q gpu_hack
 set -e
 unset -f __conda_hashr 2>/dev/null || true
 
@@ -22,8 +46,8 @@ mkdir -p $SENTINEL_DIR
 SENTINEL=$SENTINEL_DIR/done_${PBS_JOBID:-unknown}
 
 # Head/non-head pattern (PBS pbsdsh launches script on every node;
-# only head sees PBS_NODEFILE).  ezpz on the head will spawn the
-# remote ranks via mpiexec under the hood, so non-head workers wait.
+# only head sees PBS_NODEFILE).  Direct mpiexec on the head spawns the
+# remote ranks; non-head workers wait on a sentinel file.
 if [ -z "${PBS_NODEFILE:-}" ]; then
     echo "[non-head $(hostname)] waiting on sentinel"
     START=$(date +%s); MAX_WAIT=3300
@@ -47,8 +71,9 @@ PPN=${PPN:-2}
 NRANKS=$((NNODES * PPN))
 
 echo "============================================================"
-echo "  ezpz multinode TraDo-4B GRPO: ${NNODES}x${PPN}=${NRANKS} ranks"
-echo "  Head: $(hostname)   PBS: ${PBS_JOBID}"
+echo "  Aurora multinode TraDo-4B GRPO (working recipe v8g)"
+echo "  ${NNODES}x${PPN}=${NRANKS} ranks   Head: $(hostname)"
+echo "  PBS: ${PBS_JOBID}"
 cat $PBS_NODEFILE | sed 's/^/    /'
 echo "============================================================"
 
@@ -56,8 +81,12 @@ module use /soft/modulefiles 2>/dev/null || true
 module load frameworks/2025.2.0 2>/dev/null || true
 [ -n "$AURORA_VENV" ] && source "$AURORA_VENV/bin/activate"
 
-python -c "import ezpz" 2>/dev/null || python -m pip install --user 'ezpz @ git+https://github.com/saforem2/ezpz'
+# ezpz still used in user code for torch.distributed bootstrap, but NOT
+# as the launcher.  Install if missing (NOT --user; --no-build-isolation
+# fails because hatchling isn't pre-installed).
+python -c "import ezpz" 2>/dev/null || python -m pip install 'ezpz @ git+https://github.com/saforem2/ezpz'
 
+# libmpi.so.12 visibility for oneCCL OFI/MPI bootstrap.
 LIBMPI_DIR=""
 for d in "$I_MPI_ROOT/lib/release" "$I_MPI_ROOT/lib" \
          /opt/aurora/*/oneapi/mpi/latest/lib/release \
@@ -69,17 +98,22 @@ done
 
 unset ZE_FLAT_DEVICE_HIERARCHY ZE_AFFINITY_MASK ONEAPI_DEVICE_SELECTOR
 
-# ezpz reads NGPU_PER_HOST and PBS_NODEFILE to determine topology
+# ---- Working v8g multinode env ----
 export NGPU_PER_HOST=$PPN
-
-# Aurora oneCCL essentials per ALCF docs
 export PALS_PMI=pmix
 export CCL_PROCESS_LAUNCHER=pmix
-export CCL_ATL_TRANSPORT=mpi
-export CCL_KVS_MODE=mpi
+export CCL_ATL_TRANSPORT=ofi          # KEY: bypass MPI ATL (cxil_map path)
+export CCL_KVS_MODE=pmi               # KEY: required when ATL=ofi
 export FI_MR_CACHE_MONITOR=userfaultfd
 export CCL_ZE_IPC_EXCHANGE=sockets
 export FI_PROVIDER=cxi
+# CXI provider workarounds for cxil_map: write error -- THE actual fix
+export FI_CXI_DISABLE_HOST_REGISTER=1
+export FI_CXI_OPTIMIZED_MRS=0
+export FI_MR_CACHE_MAX_COUNT=0
+# torch.distributed master endpoint (head node)
+export MASTER_ADDR=$(head -n 1 $PBS_NODEFILE)
+export MASTER_PORT=29500
 
 export WANDB_MODE=offline
 export WANDB_DIR=$RUN_DIR/wandb
@@ -141,13 +175,16 @@ d["max_completion_length"] = 128
 d["max_prompt_length"] = 128
 d["block_length"] = 32
 d["diffusion_steps"] = 64
+# v8g: skip HF Trainer auto-init of clearml (no creds in user code)
+d["report_to"] = ["wandb"]
 p.write_text(yaml.safe_dump(d, sort_keys=False))
 PY
 
 cp $(dirname $0)/ds_config_zero3.json $RUN_DIR/ds_config_zero3.json
 
-echo "=== ezpz launch (NGPU_PER_HOST=$NGPU_PER_HOST, NNODES=$NNODES, NRANKS=$NRANKS) ==="
-ezpz launch \
+echo "=== direct mpiexec (NRANKS=$NRANKS, MASTER_ADDR=$MASTER_ADDR, ATL=$CCL_ATL_TRANSPORT) ==="
+mpiexec -n $NRANKS --ppn $PPN --hostfile $PBS_NODEFILE \
+    --cpu-bind list:1-8:9-16:17-24:25-32:33-40:41-48:53-60:61-68:69-76:77-84:85-92:93-100 \
     python diffu_grpo_train.py \
     --config slurm_scripts/train_trado.yaml \
     --model_path "$MODEL_DIR" \

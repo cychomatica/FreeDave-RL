@@ -28,9 +28,9 @@ module load frameworks/2025.2.0 2>/dev/null || true
 
 # Install ezpz on first run (idempotent; harmless if already installed)
 # Use `python -m pip` (bare `pip` shebang in Aurora ClearML agent venv is broken).
-# DO NOT pass --no-build-isolation: ezpz needs hatchling, which isn't installed
-# globally; let pip create an isolated build env that fetches hatchling.
-python -c "import ezpz" 2>/dev/null || python -m pip install --user 'ezpz @ git+https://github.com/saforem2/ezpz'
+# DO NOT pass --user (rejected because dill is already in the venv site-packages).
+# DO NOT pass --no-build-isolation (hatchling not pre-installed; isolation fetches it).
+python -c "import ezpz" 2>/dev/null || python -m pip install 'ezpz @ git+https://github.com/saforem2/ezpz'
 
 # libmpi.so.12 visibility (so CCL uses MPI transport, not silent OFI fallback)
 LIBMPI_DIR=""
@@ -123,6 +123,8 @@ d["max_completion_length"] = 128
 d["max_prompt_length"] = 128
 d["block_length"] = 32
 d["diffusion_steps"] = 64
+# Skip HF Trainer auto-init of clearml (no creds in user code, would crash run)
+d["report_to"] = ["wandb"]
 p.write_text(yaml.safe_dump(d, sort_keys=False))
 PY
 
