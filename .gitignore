@@ -5,3 +5,11 @@ __pycache__
 checkpoints
 .history
 eval/evals_results
+
+venvs/*
+
+CLAUDE.md
+
+wandb/*
+
+core.*
