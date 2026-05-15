@@ -1,0 +1,48 @@
+#!/bin/bash
+#PBS -q gpu_hack
+#PBS -A gpu_hack
+#PBS -l select=2:ngpus=4
+#PBS -l walltime=01:00:00
+#PBS -l filesystems=home:eagle
+#PBS -N dream_training
+#PBS -o logs/output.log
+#PBS -e logs/error.log
+
+cd $PBS_O_WORKDIR
+mkdir -p logs
+
+module use /soft/modulefiles
+module load conda
+conda activate venvs/torch-clone
+
+export LOGDIR=checkpoints
+mkdir -p $LOGDIR
+export HF_HOME=/lus/eagle/projects/lighthouse-purdue/michaelholm/hf_cache
+
+DATASET="math"
+MODEL_PATH=Dream-org/Dream-v0-Instruct-7B
+RUN_NAME=${MODEL_PATH}_${DATASET}_dream_bs12
+NUM_ITER=12
+MASK_ID=151666
+
+MASTER_NODE=$(head -1 $PBS_NODEFILE)
+MASTER_IP=$(getent hosts $MASTER_NODE | awk '{print $1}' | head -1)
+
+echo "Master: $MASTER_NODE ($MASTER_IP)"
+cat $PBS_NODEFILE
+
+# Use accelerate launch
+accelerate launch \
+    --config_file accelerate.yaml \
+    --multi_gpu \
+    --main_process_ip=$MASTER_IP \
+    --main_process_port=13378 \
+    --machine_rank=$((PMI_RANK / 4)) \
+    diffu_grpo_train.py \
+    --config slurm_scripts/train_dream.yaml \
+    --model_path $MODEL_PATH \
+    --num_iterations $NUM_ITER \
+    --dataset $DATASET \
+    --run_name $RUN_NAME \
+    --output_dir checkpoints/$RUN_NAME \
+    --mask_id $MASK_ID
