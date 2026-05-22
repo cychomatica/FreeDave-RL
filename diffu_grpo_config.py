@@ -392,6 +392,14 @@ class DiffuGRPOConfig(TrainingArguments):
             "help": "Upper epsilon for clipping; defaults to epsilon if None (e.g. DAPO recommends ~0.28)."
         },
     )
+    rejection_scale: float = field(
+        default=2.0,
+        metadata={
+            "help": "Loss multiplier for tokens belonging to rejected completions (advantage < 0). "
+            "Values > 1.0 penalize wrong answers more aggressively than correct ones are rewarded. "
+            "Set to 1.0 to disable."
+        },
+    )
     reward_weights: Optional[list[float]] = field(
         default=None,
         metadata={
@@ -554,3 +562,11 @@ class DiffuGRPOConfig(TrainingArguments):
                 )
         if self.delta is not None and self.use_liger_loss:
             raise ValueError("Liger loss does not support two-sided GRPO loss yet.")
+
+        if self.save_strategy == "steps" and self.save_steps % self.num_iterations != 0:
+            nearest = (self.save_steps // self.num_iterations) * self.num_iterations
+            raise ValueError(
+                f"save_steps ({self.save_steps}) must be divisible by num_iterations ({self.num_iterations}). "
+                f"The step counter increments in multiples of num_iterations, so save_steps will never be hit exactly. "
+                f"Try save_steps={nearest} or save_steps={nearest + self.num_iterations}."
+            )

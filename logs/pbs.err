@@ -1,0 +1,10 @@
+tee: 'standard output': Disk quota exceeded
+cat: write error: Disk quota exceeded
+/var/spool/pbs/mom_priv/jobs/7165169.polaris-pbs-01.hsn.cm.polaris.alcf.anl.gov.SC: line 71: echo: write error: Disk quota exceeded
+tee: 'standard output': Disk quota exceeded
+/var/spool/pbs/mom_priv/jobs/7165169.polaris-pbs-01.hsn.cm.polaris.alcf.anl.gov.SC: line 133: echo: write error: Disk quota exceeded
+cat: write error: Disk quota exceeded
+/var/spool/pbs/mom_priv/jobs/7165196.polaris-pbs-01.hsn.cm.polaris.alcf.anl.gov.SC: line 71: echo: write error: Disk quota exceeded
+tee: 'standard output': Disk quota exceeded
+tee: 'standard output': Disk quota exceeded
+qsub: would exceed queue capacity's per-project limit
