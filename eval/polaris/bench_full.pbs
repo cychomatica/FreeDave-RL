@@ -1,0 +1,97 @@
+#!/bin/bash -l
+# ---------------------------------------------------------------------------
+# FreeDave FULL baseline -- Polaris, 1 node, 4-GPU data-parallel sharding.
+# One process per A100 handles a strided slice; results are merged afterward.
+# Queue: capacity (1-4 nodes, walltime up to 168h, non-preemptable) -- the right
+# home for a multi-hour single-node job (prod needs >=10 nodes; debug caps at 1h).
+#
+# Submit (override dataset/size/log per run):
+#   qsub -N ff_math  -o .../logs/bench_full_math.out  -v DATASET=math,NEXAMPLES=100  eval/polaris/bench_full.pbs
+#   qsub -N ff_gsm8k -o .../logs/bench_full_gsm8k.out -v DATASET=gsm8k,NEXAMPLES=100 eval/polaris/bench_full.pbs
+# ---------------------------------------------------------------------------
+#PBS -N freedave_full
+#PBS -A lighthouse-purdue
+#PBS -q capacity
+#PBS -l select=1:system=polaris
+#PBS -l place=scatter
+#PBS -l walltime=06:00:00
+#PBS -l filesystems=home:eagle
+#PBS -j oe
+#PBS -o /eagle/lighthouse-purdue/michaelholm/freedave_bench/logs/bench_full.out
+
+DATASET=${DATASET:-math}
+NEXAMPLES=${NEXAMPLES:-100}
+MAXGEN=${MAXGEN:-2048}
+NSHARD=4
+
+PROJ=/home/michaelholm/FreeDave-RL
+EAGLE=/eagle/lighthouse-purdue/michaelholm/freedave_bench
+RES=$EAGLE/results
+LOGS=$EAGLE/logs
+mkdir -p "$RES" "$LOGS"
+
+export HF_HOME=$EAGLE/hf_cache
+export HF_HUB_CACHE=$HF_HOME/hub
+export HF_DATASETS_CACHE=$HF_HOME/datasets
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export OMP_NUM_THREADS=8
+export OPENBLAS_NUM_THREADS=8
+export MKL_NUM_THREADS=8
+export TOKENIZERS_PARALLELISM=false
+export PYTHONUNBUFFERED=1   # flush shard prints live so long (preemptable) runs are monitorable
+
+module use /soft/modulefiles
+module load conda
+conda activate base
+source "$EAGLE/venv/bin/activate"
+
+cd "$PROJ"
+echo "===================================================================="
+echo "host=$(hostname)  dataset=$DATASET  nexamples=$NEXAMPLES  maxgen=$MAXGEN  nshard=$NSHARD"
+echo "python=$(which python)"
+nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader || true
+echo "===================================================================="
+
+# Pre-build the dataset (load + .map) ONCE, single-process, so the parallel shards
+# hit a warm cache read-only. Without this, 4 concurrent .map() calls race on the
+# same cache-*.arrow file and a shard dies (FileNotFoundError).
+echo "pre-building $DATASET dataset cache ..."
+python - <<PY
+from data_utils import get_math_questions, get_gsm8k_questions
+ds = "$DATASET"
+(get_math_questions if ds == "math" else get_gsm8k_questions)("test")
+print("dataset cache ready")
+PY
+
+# Launch one shard per GPU in parallel.
+pids=()
+for s in $(seq 0 $((NSHARD - 1))); do
+    CUDA_VISIBLE_DEVICES=$s python -m eval.freedave_bench \
+        --model_name Gen-Verse/TraDo-4B-Instruct \
+        --dataset "$DATASET" --split test --num_examples "$NEXAMPLES" \
+        --block_length 4 --max_gen_length "$MAXGEN" \
+        --draft_steps 1 4 8 --eager --early_exit \
+        --num_shards "$NSHARD" --shard_id "$s" \
+        --mask_id 151669 --eos_id 151643 --pad_id 151643 \
+        --output "$RES/${DATASET}_shard${s}.json" \
+        > "$LOGS/${DATASET}_shard${s}.log" 2>&1 &
+    pid=$!
+    pids+=("$pid")
+    echo "launched shard $s on GPU $s (pid $pid)"
+done
+
+# Wait for all shards; record any failure.
+fail=0
+for s in "${!pids[@]}"; do
+    if wait "${pids[$s]}"; then echo "shard $s OK"; else echo "shard $s FAILED (see $LOGS/${DATASET}_shard${s}.log)"; fail=1; fi
+done
+
+echo "==================== per-shard tails ===================="
+for s in $(seq 0 $((NSHARD - 1))); do echo "--- shard $s ---"; tail -n 3 "$LOGS/${DATASET}_shard${s}.log"; done
+
+echo "==================== merged result ===================="
+python -m eval.aggregate_shards "$RES"/${DATASET}_shard*.json --output "$RES/${DATASET}_full.json" || fail=1
+
+echo "DONE rc=$fail"
+exit $fail

@@ -1,0 +1,71 @@
+#!/bin/bash -l
+# ---------------------------------------------------------------------------
+# FreeDave benchmark -- Polaris DEBUG-queue smoke test (1 node, 1 A100).
+# Submit from the repo root:   qsub eval/polaris/bench_debug.pbs
+# Debug queue: 1-2 nodes, walltime <= 1:00:00.
+# ---------------------------------------------------------------------------
+#PBS -N freedave_bench_debug
+#PBS -A lighthouse-purdue
+#PBS -q debug
+#PBS -l select=1:system=polaris
+#PBS -l place=scatter
+#PBS -l walltime=00:45:00
+#PBS -l filesystems=home:eagle
+#PBS -j oe
+#PBS -o /eagle/lighthouse-purdue/michaelholm/freedave_bench/logs/bench_debug.out
+
+PROJ=/home/michaelholm/FreeDave-RL
+EAGLE=/eagle/lighthouse-purdue/michaelholm/freedave_bench
+
+# --- HF caches on eagle (home has a tight quota; models are ~8 GB) ---
+export HF_HOME=$EAGLE/hf_cache
+export HF_HUB_CACHE=$HF_HOME/hub
+export HF_DATASETS_CACHE=$HF_HOME/datasets
+# Model + datasets are pre-cached on eagle -> run fully offline (no compute-node net dependency).
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+
+# --- compute-node internet via the ALCF proxy (fallback if not pre-cached) ---
+export HTTP_PROXY=http://proxy.alcf.anl.gov:3128
+export HTTPS_PROXY=http://proxy.alcf.anl.gov:3128
+export http_proxy=http://proxy.alcf.anl.gov:3128
+export https_proxy=http://proxy.alcf.anl.gov:3128
+
+# --- runtime hygiene ---
+# Bound BLAS/OpenMP thread pools so numpy/OpenBLAS import cleanly (see prefetch.sh).
+export OMP_NUM_THREADS=16
+export OPENBLAS_NUM_THREADS=16
+export MKL_NUM_THREADS=16
+export TOKENIZERS_PARALLELISM=false
+
+# --- environment (ALCF base conda: Polaris-built torch; + venv for extra deps) ---
+# NOTE: do NOT use a hand-rolled conda env with a pip torch -- it pulls a CUDA
+# build the Polaris driver cannot run. See eval/polaris/setup_env.sh.
+module use /soft/modulefiles
+module load conda
+conda activate base
+source /eagle/lighthouse-purdue/michaelholm/freedave_bench/venv/bin/activate
+
+# --- pin to a single GPU (FreeDave decodes with batch_size=1, one process) ---
+export CUDA_VISIBLE_DEVICES=0
+
+cd $PROJ
+echo "===================================================================="
+echo "host=$(hostname)  jobid=${PBS_JOBID:-none}  python=$(which python)"
+echo "HF_HOME=$HF_HOME  CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
+echo "===================================================================="
+
+# Small, fast smoke test: baseline (d=1, static) vs FreeDave (d=8).
+python -m eval.freedave_bench \
+    --model_name Gen-Verse/TraDo-4B-Instruct \
+    --dataset math --split test --num_examples 5 \
+    --block_length 4 --max_gen_length 256 \
+    --draft_steps 1 8 \
+    --mask_id 151669 --eos_id 151643 --pad_id 151643 \
+    --output $EAGLE/results/trado4b_math_debug.json \
+    --verbose
+rc=$?
+
+echo "DONE rc=$rc"
+exit $rc

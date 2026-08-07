@@ -1,0 +1,58 @@
+#!/bin/bash -l
+# ---------------------------------------------------------------------------
+# FreeDave "quick baseline" -- Polaris DEBUG queue (1 node, 1 A100).
+# Bigger than the smoke test: eager (FreeDave+), draft-step sweep, longer gen.
+# Submit from the repo root:   qsub eval/polaris/bench_quick.pbs
+# ---------------------------------------------------------------------------
+#PBS -N freedave_bench_quick
+#PBS -A lighthouse-purdue
+#PBS -q debug
+#PBS -l select=1:system=polaris
+#PBS -l place=scatter
+#PBS -l walltime=01:00:00
+#PBS -l filesystems=home:eagle
+#PBS -j oe
+#PBS -o /eagle/lighthouse-purdue/michaelholm/freedave_bench/logs/bench_quick.out
+
+PROJ=/home/michaelholm/FreeDave-RL
+EAGLE=/eagle/lighthouse-purdue/michaelholm/freedave_bench
+
+export HF_HOME=$EAGLE/hf_cache
+export HF_HUB_CACHE=$HF_HOME/hub
+export HF_DATASETS_CACHE=$HF_HOME/datasets
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+
+export OMP_NUM_THREADS=16
+export OPENBLAS_NUM_THREADS=16
+export MKL_NUM_THREADS=16
+export TOKENIZERS_PARALLELISM=false
+
+# ALCF base conda (Polaris-built torch) + venv for extra deps. Never pip-install torch.
+module use /soft/modulefiles
+module load conda
+conda activate base
+source /eagle/lighthouse-purdue/michaelholm/freedave_bench/venv/bin/activate
+
+export CUDA_VISIBLE_DEVICES=0
+
+cd $PROJ
+echo "===================================================================="
+echo "host=$(hostname)  jobid=${PBS_JOBID:-none}  python=$(which python)"
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
+echo "===================================================================="
+
+# Quick baseline: static (d=1) vs FreeDave+ (d=4,8, eager), 20 examples, 1024 tokens.
+# Results are saved after each draft-step setting, so a walltime cutoff keeps finished points.
+python -m eval.freedave_bench \
+    --model_name Gen-Verse/TraDo-4B-Instruct \
+    --dataset math --split test --num_examples 20 \
+    --block_length 4 --max_gen_length 1024 \
+    --draft_steps 1 4 8 --eager \
+    --mask_id 151669 --eos_id 151643 --pad_id 151643 \
+    --output $EAGLE/results/trado4b_math_quick.json \
+    --verbose
+rc=$?
+
+echo "DONE rc=$rc"
+exit $rc
