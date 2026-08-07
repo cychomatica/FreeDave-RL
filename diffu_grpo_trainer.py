@@ -184,7 +184,13 @@ class DiffuGRPOTrainer(GRPOTrainer):
         if self.beta != 0.0:
             per_token_loss = per_token_loss + self.beta * per_token_kl
 
-        loss = (per_token_loss * active_mask).sum() / active_mask.sum()
+        # Guard against inf/nan before the weighted sum: inf * 0 (from active_mask) = nan.
+        # nan_to_num keeps the grad graph intact while clamping degenerate tokens to 0.
+        per_token_loss = torch.nan_to_num(per_token_loss, nan=0.0, posinf=0.0, neginf=0.0)
+
+        rejection_weight = torch.where(advantages.unsqueeze(1) < 0, self.args.rejection_scale, 1.0)
+        weights = active_mask * rejection_weight
+        loss = (per_token_loss * weights).sum() / (weights.sum() + 1e-8)
 
         mode = "eval" if self.control.should_evaluate else "train"
 

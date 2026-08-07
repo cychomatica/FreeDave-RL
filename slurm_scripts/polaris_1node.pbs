@@ -1,0 +1,76 @@
+#!/bin/bash
+
+# ── PBS directives ────────────────────────────────────────────────────────────
+#PBS -N freedave-trado
+#PBS -l select=1:system=polaris
+#PBS -l place=scatter
+#PBS -l walltime=01:00:00
+#PBS -l filesystems=home:eagle
+#PBS -q debug
+#PBS -A lighthouse-purdue
+#PBS -o logs/pbs.out
+#PBS -e logs/pbs.err
+#PBS -v WANDB_API_KEY
+
+cd $PBS_O_WORKDIR
+
+# ── Environment setup ─────────────────────────────────────────────────────────
+export HF_HOME=/lus/eagle/projects/lighthouse-purdue/michaelholm/hf_cache
+export HF_DATASETS_CACHE=$HF_HOME/datasets
+export HF_HUB_CACHE=$HF_HOME/hub
+export OPENBLAS_NUM_THREADS=1
+export OMP_NUM_THREADS=1
+export PYTHONNOUSERSITE=1
+
+# Set WANDB_API_KEY in your ~/.bashrc to enable wandb. If unset, wandb is disabled.
+if [ -z "$WANDB_API_KEY" ]; then
+    export WANDB_MODE=disabled
+else
+    export WANDB_API_KEY
+fi
+
+export HTTP_PROXY="http://proxy.alcf.anl.gov:3128"
+export HTTPS_PROXY="http://proxy.alcf.anl.gov:3128"
+export http_proxy="http://proxy.alcf.anl.gov:3128"
+export https_proxy="http://proxy.alcf.anl.gov:3128"
+export ftp_proxy="http://proxy.alcf.anl.gov:3128"
+export no_proxy="admin,polaris-adminvm-01,localhost,*.cm.polaris.alcf.anl.gov,polaris-*,*.polaris.alcf.anl.gov,*.alcf.anl.gov"
+
+# ── Node/GPU layout ───────────────────────────────────────────────────────────
+NRANKS_PER_NODE=4                          # Polaris has 4 A100s per node
+MASTER_PORT=12346
+
+echo "GPUs: $NRANKS_PER_NODE"
+cat $PBS_NODEFILE
+
+# ── Training config ───────────────────────────────────────────────────────────
+DATASET="math"
+MODEL_PATH=Gen-Verse/TraDo-4B-Instruct
+MODEL_BASENAME=$(basename $MODEL_PATH)
+RUN_NAME=${MODEL_BASENAME}_${DATASET}_1node
+
+LOGDIR=/lus/eagle/projects/lighthouse-purdue/michaelholm/logs/${PBS_JOBID}
+mkdir -p $LOGDIR logs
+
+GENERATION_BATCH_SIZE=$((NRANKS_PER_NODE * 3))  # per_device_train_batch_size=3, must match global batch
+
+# ── Launch ────────────────────────────────────────────────────────────────────
+
+# Poll nvidia-smi every 60s in the background
+while true; do
+    echo "=== $(hostname) $(date) ===" >> $LOGDIR/gpu_usage.log
+    nvidia-smi --query-gpu=index,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits >> $LOGDIR/gpu_usage.log
+    sleep 60
+done &
+
+/lus/eagle/projects/lighthouse-purdue/michaelholm/venvs/venvs/torch-clone/bin/accelerate launch \
+    --config_file $PBS_O_WORKDIR/slurm_scripts/accelerate_polaris_1node.yaml \
+    --main_process_port $MASTER_PORT \
+    $PBS_O_WORKDIR/diffu_grpo_train.py \
+    --config $PBS_O_WORKDIR/slurm_scripts/train_trado.yaml \
+    --model_path $MODEL_PATH \
+    --dataset $DATASET \
+    --run_name $RUN_NAME \
+    --output_dir $LOGDIR/checkpoints \
+    --generation_batch_size $GENERATION_BATCH_SIZE \
+2>&1 | tee $LOGDIR/rank_0.log

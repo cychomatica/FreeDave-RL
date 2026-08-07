@@ -1,0 +1,137 @@
+#!/bin/bash
+
+# ── PBS directives ────────────────────────────────────────────────────────────
+#PBS -N freedave-trado-prod
+#PBS -l select=1:system=polaris
+#PBS -l place=scatter
+#PBS -l walltime=24:00:00
+#PBS -l filesystems=home:eagle
+#PBS -q prod
+#PBS -A lighthouse-purdue
+#PBS -o logs/pbs.out
+#PBS -e logs/pbs.err
+#PBS -v WANDB_API_KEY
+
+cd $PBS_O_WORKDIR
+
+# ── How many epochs to train total ───────────────────────────────────────────
+# When training finishes a 24-hour segment, this script resubmits itself.
+# It keeps doing so until the latest checkpoint has reached TARGET_EPOCHS.
+TARGET_EPOCHS=10
+
+# ── Environment setup ─────────────────────────────────────────────────────────
+export HF_HOME=/lus/eagle/projects/lighthouse-purdue/michaelholm/hf_cache
+export HF_DATASETS_CACHE=$HF_HOME/datasets
+export HF_HUB_CACHE=$HF_HOME/hub
+export OPENBLAS_NUM_THREADS=1
+export OMP_NUM_THREADS=1
+export PYTHONNOUSERSITE=1
+
+export HTTP_PROXY="http://proxy.alcf.anl.gov:3128"
+export HTTPS_PROXY="http://proxy.alcf.anl.gov:3128"
+export http_proxy="http://proxy.alcf.anl.gov:3128"
+export https_proxy="http://proxy.alcf.anl.gov:3128"
+export ftp_proxy="http://proxy.alcf.anl.gov:3128"
+export no_proxy="admin,polaris-adminvm-01,localhost,*.cm.polaris.alcf.anl.gov,polaris-*,*.polaris.alcf.anl.gov,*.alcf.anl.gov"
+
+# ── Training config ───────────────────────────────────────────────────────────
+NRANKS_PER_NODE=4
+MASTER_PORT=12346
+DATASET="math"
+MODEL_PATH=Gen-Verse/TraDo-4B-Instruct
+MODEL_BASENAME=$(basename $MODEL_PATH)
+RUN_NAME=${MODEL_BASENAME}_${DATASET}_prod
+
+# Checkpoints use a stable path (not job-ID-based) so resume works across jobs.
+# Logs are job-specific so each 24-hour segment has its own output file.
+CHECKPOINT_DIR=/lus/eagle/projects/lighthouse-purdue/michaelholm/runs/${RUN_NAME}/checkpoints
+LOGDIR=/lus/eagle/projects/lighthouse-purdue/michaelholm/logs/${PBS_JOBID}
+mkdir -p $LOGDIR $CHECKPOINT_DIR logs
+
+GENERATION_BATCH_SIZE=$((NRANKS_PER_NODE * 3))
+
+echo "Nodes: 1  GPUs: $NRANKS_PER_NODE"
+cat $PBS_NODEFILE
+
+# ── Resume logic ──────────────────────────────────────────────────────────────
+LATEST_CHECKPOINT=$(ls -td $CHECKPOINT_DIR/checkpoint-* 2>/dev/null | head -1)
+CURRENT_EPOCH=0
+RESUME_ARG=""
+
+if [ -n "$LATEST_CHECKPOINT" ]; then
+    CURRENT_EPOCH=$(python3 -c "
+import json, math
+try:
+    with open('$LATEST_CHECKPOINT/trainer_state.json') as f:
+        print(math.floor(float(json.load(f).get('epoch', 0))))
+except:
+    print(0)
+")
+    RESUME_ARG="--resume_from_checkpoint $LATEST_CHECKPOINT"
+    echo "Resuming from $LATEST_CHECKPOINT (epoch $CURRENT_EPOCH / $TARGET_EPOCHS)"
+else
+    echo "No checkpoint found, starting from scratch"
+fi
+
+if [ "$CURRENT_EPOCH" -ge "$TARGET_EPOCHS" ]; then
+    echo "Already at target epochs ($TARGET_EPOCHS), nothing to do."
+    exit 0
+fi
+
+# ── wandb setup ───────────────────────────────────────────────────────────────
+# All jobs share the same wandb run ID so the graphs appear as one continuous
+# run. WANDB_RESUME=allow means new data logged from the checkpoint step
+# overwrites any previously logged data for those steps.
+WANDB_RUN_ID=$(echo "$RUN_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | cut -c1-64)
+export WANDB_RUN_ID
+
+if [ -z "$WANDB_API_KEY" ]; then
+    export WANDB_MODE=disabled
+else
+    export WANDB_API_KEY
+    if [ -n "$LATEST_CHECKPOINT" ]; then
+        export WANDB_RESUME=allow
+    fi
+fi
+
+# ── Launch ────────────────────────────────────────────────────────────────────
+
+# Poll nvidia-smi every 60s in the background
+while true; do
+    echo "=== $(hostname) $(date) ===" >> $LOGDIR/gpu_usage.log
+    nvidia-smi --query-gpu=index,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits >> $LOGDIR/gpu_usage.log
+    sleep 60
+done &
+
+/lus/eagle/projects/lighthouse-purdue/michaelholm/venvs/venvs/torch-clone/bin/accelerate launch \
+    --config_file $PBS_O_WORKDIR/slurm_scripts/accelerate_polaris_1node.yaml \
+    --main_process_port $MASTER_PORT \
+    $PBS_O_WORKDIR/diffu_grpo_train.py \
+    --config $PBS_O_WORKDIR/slurm_scripts/train_trado.yaml \
+    --model_path $MODEL_PATH \
+    --dataset $DATASET \
+    --run_name $RUN_NAME \
+    --output_dir $CHECKPOINT_DIR \
+    --generation_batch_size $GENERATION_BATCH_SIZE \
+    $RESUME_ARG \
+2>&1 | tee $LOGDIR/rank_0.log
+
+# ── Resubmit if more epochs remain ────────────────────────────────────────────
+LATEST_CHECKPOINT=$(ls -td $CHECKPOINT_DIR/checkpoint-* 2>/dev/null | head -1)
+if [ -n "$LATEST_CHECKPOINT" ]; then
+    CURRENT_EPOCH=$(python3 -c "
+import json, math
+try:
+    with open('$LATEST_CHECKPOINT/trainer_state.json') as f:
+        print(math.floor(float(json.load(f).get('epoch', 0))))
+except:
+    print(0)
+")
+fi
+
+if [ "$CURRENT_EPOCH" -lt "$TARGET_EPOCHS" ]; then
+    echo "Reached epoch $CURRENT_EPOCH / $TARGET_EPOCHS. Resubmitting..."
+    qsub $PBS_O_WORKDIR/slurm_scripts/polaris_1node_prod.pbs
+else
+    echo "Training complete! Reached $TARGET_EPOCHS epochs."
+fi

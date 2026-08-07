@@ -39,8 +39,8 @@ logging_steps: 1
 learning_rate: 3e-6
 lr_scheduler_type: constant_with_warmup
 
-num_generations: 6
-num_train_epochs: 10
+num_generations: 4
+num_train_epochs: 5
 
 per_device_eval_batch_size: 1
 per_device_train_batch_size: 3
@@ -57,9 +57,9 @@ run_name: gsm_sft_bs12
 output_dir: /checkpoints/gsm_sft_bs12  # <-- Replace with desired output directory
 
 # Parameters for saving checkpoints
-save_steps: 50000
+save_steps: 96
 save_strategy: steps
-save_total_limit: 500
+save_total_limit: 1
 # Skip DeepSpeed ZeRO shards (global_step*/optim_states.pt, model_states.pt). Keeps ~adapter_model.safetensors + tokenizer + trainer_state.
 # You cannot resume optimizer/training state from these checkpoints—only reload the LoRA adapter.
 save_only_model: true
@@ -68,12 +68,13 @@ save_only_model: true
 max_completion_length: 256
 max_prompt_length: 200
 block_length: 32
-diffusion_steps: 256
-generation_batch_size: 6
+diffusion_steps: 128
+generation_batch_size: 24
 remasking: low_confidence
 random_masking: True
 p_mask_prompt: 0.15
 beta: 0.04
 epsilon: 0.5
+rejection_scale: 2.0
 num_iterations: 12
 temperature: 0.0
